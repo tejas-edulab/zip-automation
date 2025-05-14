@@ -1,0 +1,9 @@
+COMPRESSED_FOLDER/
+node_modules/
+READY_TO_UPLOAD_ZIPS/
+SCANNED_FOLDER/
+SLR-WA-36/
+CA-5/
+CA-5.zip
+package-lock.json
+scan-log.txt

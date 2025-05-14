@@ -1,0 +1,22 @@
+{
+  "name": "upload-automation",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "bin": "index.js",
+   "pkg": {
+    "assets": ["bin/**/*"]
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "chokidar": "^4.0.3",
+    "inquirer": "^12.6.1",
+    "inquirer-directory": "^2.2.0",
+    "node-fetch": "^2.7.0"
+  }
+}
