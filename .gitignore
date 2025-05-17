@@ -7,3 +7,8 @@ CA-5/
 CA-5.zip
 package-lock.json
 scan-log.txt
+ERROR_FOLDER/
+LINEARIZED_FOLDER/
+UPLOAD_FOLDER/
+UPLOAD_ERROR/
+.DS_Store
