@@ -7,12 +7,36 @@ import { exec } from "child_process";
 import archiver from "archiver";
 import directory from "inquirer-directory";
 import pdf from "pdf-parse";
+import dns from "node:dns";
 
 // Initialization
 const CSV_LOG_FILE = "scan-log.csv";
 const LOG_FILE = "scan-log.txt";
 const PDF_REPORT_FILE = "pdf-report.csv";
-let SCANNER_NAME, PC_NAME, SCANNED_FOLDER, COMPRESSED_FOLDER, READY_TO_UPLOAD_ZIPS;
+const MAX_FILES_PER_UPLOAD = 5; // Maximum files to upload in one batch
+let SCANNER_NAME, PC_NAME;
+
+// Initialize folder paths
+const DEFAULT_PATHS = {
+  SCANNED_FOLDER: path.join(process.cwd(), "SCANNED_FOLDER"),
+  COMPRESSED_FOLDER: path.join(process.cwd(), "COMPRESSED_FOLDER"),
+  READY_TO_UPLOAD_ZIPS: path.join(process.cwd(), "READY_TO_UPLOAD_FOLDER"),
+  LINEARIZED_FOLDER: path.join(process.cwd(), "LINEARIZED_FOLDER"),
+  UPLOAD_FOLDER: path.join(process.cwd(), "UPLOAD_FOLDER"),
+  ERROR_FOLDER: path.join(process.cwd(), "ERROR_FOLDER"),
+  SYSTEM_UPLOADED: path.join(process.cwd(), "SYSTEM_UPLOADED"),
+  UPLOAD_ERROR: path.join(process.cwd(), "UPLOAD_ERROR"),
+};
+
+let SCANNED_FOLDER = DEFAULT_PATHS.SCANNED_FOLDER;
+let COMPRESSED_FOLDER = DEFAULT_PATHS.COMPRESSED_FOLDER;
+let READY_TO_UPLOAD_ZIPS = DEFAULT_PATHS.READY_TO_UPLOAD_ZIPS;
+let LINEARIZED_FOLDER = DEFAULT_PATHS.LINEARIZED_FOLDER;
+let UPLOAD_FOLDER = DEFAULT_PATHS.UPLOAD_FOLDER;
+let ERROR_FOLDER = DEFAULT_PATHS.ERROR_FOLDER;
+let SYSTEM_UPLOADED = DEFAULT_PATHS.SYSTEM_UPLOADED;
+let UPLOAD_ERROR = DEFAULT_PATHS.UPLOAD_ERROR;
+
 const isWin = process.platform === "win32";
 const gsPackage = isWin ? "gswin64c" : "gs";
 const logStream = fs.createWriteStream(LOG_FILE, { flags: "a" });
@@ -27,35 +51,54 @@ function logCsvEvent({ folder, file, status, action, message }) {
 
 // Ask for folders
 async function promptForFolders() {
+  // Create default folders if they don't exist
+  Object.values(DEFAULT_PATHS).forEach((folder) => {
+    if (!fs.existsSync(folder)) {
+      fs.mkdirSync(folder, { recursive: true });
+    }
+  });
+
   const responses = await inquirer.prompt([
     {
       type: "input",
       name: "scanner",
       message: "🧍 Scanner Name / ID:",
+      default: `Scanner-01`,
       validate: (input) => input.trim() !== "" || "Scanner name required",
     },
     {
       type: "input",
       name: "pc",
       message: "💻 PC Name / No:",
+      default: os.hostname(),
       validate: (input) => input.trim() !== "" || "PC name required",
     },
     {
       type: "input",
       name: "scanned",
       message: "📥 Enter path for SCANNED_FOLDER:",
+      default: DEFAULT_PATHS.SCANNED_FOLDER,
       validate: (input) => (fs.existsSync(input) && fs.lstatSync(input).isDirectory()) || "Invalid folder path",
     },
     {
       type: "input",
       name: "compressed",
       message: "📦 Enter path for COMPRESSED_FOLDER:",
+      default: DEFAULT_PATHS.COMPRESSED_FOLDER,
       validate: (input) => (fs.existsSync(input) && fs.lstatSync(input).isDirectory()) || "Invalid folder path",
     },
     {
       type: "input",
       name: "ready",
-      message: "🚀 Enter path for READY_TO_UPLOAD_ZIPS:",
+      message: "🚀 Enter path for READY_TO_UPLOAD_FOLDER:",
+      default: DEFAULT_PATHS.READY_TO_UPLOAD_ZIPS,
+      validate: (input) => (fs.existsSync(input) && fs.lstatSync(input).isDirectory()) || "Invalid folder path",
+    },
+    {
+      type: "input",
+      name: "linearized",
+      message: "📄 Enter path for LINEARIZED_FOLDER:",
+      default: DEFAULT_PATHS.LINEARIZED_FOLDER,
       validate: (input) => (fs.existsSync(input) && fs.lstatSync(input).isDirectory()) || "Invalid folder path",
     },
   ]);
@@ -65,6 +108,14 @@ async function promptForFolders() {
   READY_TO_UPLOAD_ZIPS = responses.ready;
   SCANNER_NAME = responses.scanner;
   PC_NAME = responses.pc;
+  LINEARIZED_FOLDER = responses.linearized;
+
+  // Create additional folders if they don't exist
+  [UPLOAD_FOLDER, ERROR_FOLDER, SYSTEM_UPLOADED, UPLOAD_ERROR].forEach((folder) => {
+    if (!fs.existsSync(folder)) {
+      fs.mkdirSync(folder, { recursive: true });
+    }
+  });
 }
 
 // Plain logger
@@ -226,73 +277,305 @@ function savePDFReport(reportData) {
   fs.appendFileSync(PDF_REPORT_FILE, csvLine);
 }
 
-// Handle folder
-async function handleNewFolder(folderPath) {
+// Move PDFs to linearized folder
+async function moveToLinearizedFolder(folderPath, pdfs) {
+  for (const file of pdfs) {
+    const sourcePath = path.join(folderPath, file);
+    const destPath = path.join(LINEARIZED_FOLDER, file);
+
+    try {
+      // Move the file
+      fs.renameSync(sourcePath, destPath);
+      logEvent(`📄 Moved ${file} to linearized folder`);
+      logCsvEvent({
+        folder: folderPath,
+        file,
+        status: "Pass",
+        action: "Move to Linearized",
+        message: `Moved to ${destPath}`,
+      });
+    } catch (err) {
+      logEvent(`❌ Failed to move ${file}: ${err}`);
+      logCsvEvent({
+        folder: folderPath,
+        file,
+        status: "Fail",
+        action: "Move to Linearized",
+        message: err.toString(),
+      });
+    }
+  }
+}
+
+// Clean up original folder
+function cleanupOriginalFolder(folderPath) {
+  try {
+    fs.rmdirSync(folderPath);
+    logEvent(`🗑️ Removed original folder: ${folderPath}`);
+    logCsvEvent({
+      folder: folderPath,
+      file: "",
+      status: "Pass",
+      action: "Cleanup",
+      message: "Original folder removed",
+    });
+  } catch (err) {
+    logEvent(`⚠️ Failed to remove original folder: ${err}`);
+    logCsvEvent({
+      folder: folderPath,
+      file: "",
+      status: "Fail",
+      action: "Cleanup",
+      message: err.toString(),
+    });
+  }
+}
+
+// Stabilize and prepare folder
+async function stabilizeAndPrepareFolder(folderPath) {
   logEvent(`📂 New folder detected: ${folderPath}`);
   logCsvEvent({ folder: folderPath, file: "", status: "Info", action: "Folder Detected", message: folderPath });
 
   await waitForFolderToStabilize(folderPath, 4000);
 
   const folderName = path.basename(folderPath);
-  const compressedTargetPath = path.join(COMPRESSED_FOLDER, folderName);
-
-  if (!fs.existsSync(compressedTargetPath)) {
-    fs.mkdirSync(compressedTargetPath, { recursive: true });
-  }
-
   const files = fs.readdirSync(folderPath);
   const pdfs = files.filter((f) => f.toLowerCase().endsWith(".pdf"));
 
   if (pdfs.length === 0) {
     logEvent(`⚠️ No PDFs found in ${folderPath}`);
     logCsvEvent({ folder: folderPath, file: "", status: "Fail", action: "No PDFs", message: "No PDF files found" });
-    return;
-  } else {
-    logEvent(`📄 ${pdfs.length} PDF(s) found in ${folderPath}`);
-    logCsvEvent({ folder: folderPath, file: "", status: "Pass", action: "PDFs Found", message: `${pdfs.length} PDFs` });
+    cleanupOriginalFolder(folderPath);
+    return null;
   }
 
-  for (const file of pdfs) {
-    const fullPath = path.join(folderPath, file);
-    const outputPath = path.join(compressedTargetPath, file);
+  logEvent(`📄 ${pdfs.length} PDF(s) found in ${folderPath}`);
+  logCsvEvent({ folder: folderPath, file: "", status: "Pass", action: "PDFs Found", message: `${pdfs.length} PDFs` });
 
-    try {
-      // Generate and save PDF report before compression
-      logEvent(`📊 Generating report for ${file}...`);
+  // Move PDFs to linearized folder before compression
+  await moveToLinearizedFolder(folderPath, pdfs);
 
-      const pdfReport = await generatePDFReport(fullPath);
-      savePDFReport(pdfReport);
+  // Clean up the original folder after moving files
+  cleanupOriginalFolder(folderPath);
 
-      logEvent(`📝 Report generated for ${file}`);
+  return { folderName, pdfs };
+}
 
-      logEvent(`🔄 Compressing ${file}...`);
-      logCsvEvent({ folder: folderPath, file, status: "Info", action: "Compressing", message: fullPath });
+// Generate PDF report
+async function generateAndSaveReport(file, fullPath) {
+  logEvent(`📊 Generating report for ${file}...`);
+  const pdfReport = await generatePDFReport(fullPath);
+  savePDFReport(pdfReport);
+  logEvent(`📝 Report generated for ${file}`);
+}
 
-      await compressPDF(fullPath, outputPath);
-
-      logEvent(`✅ Compressed: ${outputPath}`);
-      logCsvEvent({ folder: folderPath, file, status: "Pass", action: "Compressed", message: outputPath });
-    } catch (err) {
-      logEvent(`❌ Failed to process ${file}: ${err}`);
-      logCsvEvent({ folder: folderPath, file, status: "Fail", action: "Processing Failed", message: err.toString() });
-    }
-  }
-
-  const zipFileName = `${folderName}.zip`;
-  const zipFilePath = path.join(READY_TO_UPLOAD_ZIPS, zipFileName);
+// Compress PDF in memory
+async function compressPDFInMemory(inputPath) {
+  const tempOutputPath = path.join(os.tmpdir(), `compressed_${Date.now()}_${path.basename(inputPath)}`);
 
   try {
-    logEvent(`📦 Zipping compressed folder: ${compressedTargetPath}`);
-    logCsvEvent({ folder: folderPath, file: zipFileName, status: "Info", action: "Zipping", message: compressedTargetPath });
-
-    await zipFolder(compressedTargetPath, zipFilePath);
-
-    logEvent(`✅ Zipped folder stored at: ${zipFilePath}`);
-    logCsvEvent({ folder: folderPath, file: zipFileName, status: "Pass", action: "Zipped", message: zipFilePath });
+    await compressPDF(inputPath, tempOutputPath);
+    const compressedBuffer = fs.readFileSync(tempOutputPath);
+    fs.unlinkSync(tempOutputPath); // Clean up temp file
+    return compressedBuffer;
   } catch (err) {
-    logEvent(`❌ Failed to zip folder ${folderName}: ${err}`);
-    logCsvEvent({ folder: folderPath, file: zipFileName, status: "Fail", action: "Zip Failed", message: err.toString() });
+    if (fs.existsSync(tempOutputPath)) {
+      fs.unlinkSync(tempOutputPath); // Clean up temp file if it exists
+    }
+    throw err;
   }
+}
+
+// Process files in batches
+function splitIntoBatches(files, batchSize) {
+  const batches = [];
+  for (let i = 0; i < files.length; i += batchSize) {
+    batches.push(files.slice(i, i + batchSize));
+  }
+  return batches;
+}
+
+// Upload files to system API
+async function uploadToSystem(files) {
+  try {
+    const formData = new FormData();
+
+    // Process each file
+    for (const filePath of files) {
+      try {
+        logEvent(`🔄 Compressing ${path.basename(filePath)} before upload`);
+
+        // Compress the PDF
+        const compressedBuffer = await compressPDFInMemory(filePath);
+
+        // Create a Blob from the compressed buffer
+        const blob = new Blob([compressedBuffer], { type: "application/pdf" });
+        ƒˇ;
+        // Add compressed file to form data
+        formData.append("files", blob, path.basename(filePath));
+
+        logEvent(`✅ Compressed ${path.basename(filePath)} successfully`);
+      } catch (compressionError) {
+        logEvent(`⚠️ Compression failed for ${path.basename(filePath)}, using original file: ${compressionError}`);
+        // If compression fails, use original file
+        const fileStream = fs.createReadStream(filePath);
+        formData.append("files", fileStream);
+      }
+    }
+
+    logEvent(`📤 Uploading batch of ${files.length} file(s) to system`);
+    logCsvEvent({
+      folder: UPLOAD_FOLDER,
+      file: files.join(", "),
+      status: "Info",
+      action: "System Upload Started",
+      message: "Initiating upload to system API",
+    });
+
+    const response = await fetch("https://devpahsu.paperevaluation.com/v1/assessment/answer-code-bulk", {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Upload failed with status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    return { success: true, result };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Move files after upload attempt
+function moveFilesAfterUpload(files, success) {
+  const targetFolder = success ? SYSTEM_UPLOADED : UPLOAD_ERROR;
+
+  files.forEach((filePath) => {
+    const fileName = path.basename(filePath);
+    const targetPath = path.join(targetFolder, fileName);
+
+    try {
+      fs.renameSync(filePath, targetPath);
+      logEvent(`${success ? "✅" : "❌"} Moved ${fileName} to ${path.basename(targetFolder)}`);
+      logCsvEvent({
+        folder: targetFolder,
+        file: fileName,
+        status: success ? "Pass" : "Fail",
+        action: "Move After Upload",
+        message: `Moved to ${targetFolder}`,
+      });
+    } catch (err) {
+      logEvent(`❌ Error moving ${fileName}: ${err}`);
+      logCsvEvent({
+        folder: UPLOAD_FOLDER,
+        file: fileName,
+        status: "Fail",
+        action: "Move After Upload",
+        message: err.toString(),
+      });
+    }
+  });
+}
+
+// Process files in upload folder
+async function processUploadFolder() {
+  const files = fs
+    .readdirSync(UPLOAD_FOLDER)
+    .filter((f) => f.toLowerCase().endsWith(".pdf"))
+    .map((f) => path.join(UPLOAD_FOLDER, f));
+
+  if (files.length === 0) return;
+
+  logEvent(`📄 Found ${files.length} PDF(s) to upload in upload folder`);
+
+  // Split files into batches
+  const batches = splitIntoBatches(files, MAX_FILES_PER_UPLOAD);
+  logEvent(`📦 Split files into ${batches.length} batch(es) of maximum ${MAX_FILES_PER_UPLOAD} files`);
+
+  // Process each batch
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    logEvent(`🔄 Processing batch ${i + 1} of ${batches.length} (${batch.length} files)`);
+
+    const { success, result, error } = await uploadToSystem(batch);
+
+    if (success) {
+      logEvent(`✅ Successfully uploaded batch ${i + 1} (${batch.length} files)`);
+      logCsvEvent({
+        folder: UPLOAD_FOLDER,
+        file: batch.join(", "),
+        status: "Pass",
+        action: "System Upload",
+        message: JSON.stringify(result),
+      });
+      moveFilesAfterUpload(batch, true);
+    } else {
+      logEvent(`❌ Failed to upload batch ${i + 1}: ${error}`);
+      logCsvEvent({
+        folder: UPLOAD_FOLDER,
+        file: batch.join(", "),
+        status: "Fail",
+        action: "System Upload",
+        message: error,
+      });
+      moveFilesAfterUpload(batch, false);
+    }
+
+    // Add a small delay between batches
+    if (i < batches.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+}
+
+// Setup upload folder watcher
+function setupUploadWatcher() {
+  // Create necessary folders if they don't exist
+  [SYSTEM_UPLOADED, UPLOAD_ERROR].forEach((folder) => {
+    if (!fs.existsSync(folder)) {
+      fs.mkdirSync(folder, { recursive: true });
+    }
+  });
+
+  const uploadWatcher = chokidar.watch(UPLOAD_FOLDER, {
+    ignoreInitial: false,
+    depth: 0,
+    awaitWriteFinish: {
+      stabilityThreshold: 2000,
+      pollInterval: 500,
+    },
+  });
+
+  uploadWatcher.on("add", async (filePath) => {
+    if (!filePath.toLowerCase().endsWith(".pdf")) return;
+
+    // Wait for potential additional files
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+
+    await processUploadFolder();
+  });
+
+  uploadWatcher.on("error", (error) => {
+    logEvent(`❌ Upload folder watcher error: ${error}`);
+    logCsvEvent({
+      folder: UPLOAD_FOLDER,
+      file: "",
+      status: "Fail",
+      action: "Watcher Error",
+      message: error.toString(),
+    });
+  });
+
+  logEvent(`📡 Watching upload folder for system uploads`);
+  logCsvEvent({
+    folder: UPLOAD_FOLDER,
+    file: "",
+    status: "Info",
+    action: "Upload Watcher Started",
+    message: "Started watching upload folder for system uploads",
+  });
 }
 
 // Main runner
@@ -303,26 +586,41 @@ const main = async () => {
 
   await promptForFolders();
 
-  const watcher = chokidar.watch(SCANNED_FOLDER, {
-    ignoreInitial: true,
+  // Setup all watchers
+  const scanWatcher = chokidar.watch(SCANNED_FOLDER, {
+    ignoreInitial: false,
     depth: 0,
     awaitWriteFinish: {
       stabilityThreshold: 10000,
       pollInterval: 500,
     },
+    ignored: /(^|[\/\\])\../, // Ignore hidden files
   });
 
-  watcher.on("addDir", (dirPath) => {
-    handleNewFolder(dirPath);
+  // Handle new folders
+  scanWatcher.on("addDir", (dirPath) => {
+    if (dirPath !== SCANNED_FOLDER) {
+      handleNewFolder(dirPath);
+    }
   });
 
-  watcher.on("error", (error) => {
+  // Handle new PDF files
+  scanWatcher.on("add", (filePath) => {
+    if (path.dirname(filePath) === SCANNED_FOLDER && filePath.toLowerCase().endsWith(".pdf")) {
+      handleNewPDF(filePath);
+    }
+  });
+
+  scanWatcher.on("error", (error) => {
     logEvent(`❌ Watcher error: ${error}`);
     logCsvEvent({ folder: SCANNED_FOLDER, file: "", status: "Fail", action: "Watcher Error", message: error.toString() });
   });
 
   logEvent(`📡 Watching folder: ${SCANNED_FOLDER}`);
-  logCsvEvent({ folder: SCANNED_FOLDER, file: "", status: "Info", action: "Watcher Started", message: "Started watching scanned folder" });
+  logCsvEvent({ folder: SCANNED_FOLDER, file: "", status: "Info", action: "Watcher Started", message: "Started watching scanned folder for PDFs and folders" });
+
+  // Setup upload folder watcher
+  setupUploadWatcher();
 };
 
 main();
