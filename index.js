@@ -887,12 +887,40 @@ function setupLinearizedWatcher() {
 
 // Setup upload folder watcher
 function setupUploadWatcher() {
+  const UPLOAD_API_URL = process.env.UPLOAD_API_URL || "https://devpahsu.paperevaluation.com/api/v1/assessment/answer-code-bulk";
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 1000;
+
   // Create necessary folders if they don't exist
   [SYSTEM_UPLOADED, UPLOAD_ERROR].forEach((folder) => {
     if (!fs.existsSync(folder)) {
       fs.mkdirSync(folder, { recursive: true });
     }
   });
+
+  // Helper function to retry API calls
+  async function retryOperation(operation, retries = MAX_RETRIES) {
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await operation();
+      } catch (error) {
+        if (i === retries - 1) throw error;
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY * (i + 1)));
+      }
+    }
+  }
+
+  // Helper function to safely move file
+  async function safelyMoveFile(sourcePath, destPath) {
+    try {
+      await fs.promises.access(sourcePath, fs.constants.F_OK);
+      await fs.promises.rename(sourcePath, destPath);
+      return true;
+    } catch (error) {
+      logEvent(`❌ Error moving file ${path.basename(sourcePath)}: ${error.message}`);
+      return false;
+    }
+  }
 
   const uploadWatcher = chokidar.watch(UPLOAD_FOLDER, {
     ignoreInitial: false,
@@ -906,11 +934,100 @@ function setupUploadWatcher() {
   uploadWatcher.on("add", async (filePath) => {
     if (!filePath.toLowerCase().endsWith(".pdf")) return;
 
-    // Wait for potential additional files
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const fileName = path.basename(filePath);
+    logEvent(`📄 New file detected in upload folder: ${fileName}`);
 
-    // Process only the new file
-    await processUploadFolder(filePath);
+    // Check internet connection first
+    const isOnline = await checkInternetConnection();
+    if (!isOnline) {
+      logEvent("⚠️ No internet connection, skipping upload...");
+      return;
+    }
+
+    try {
+      // Read file with error handling
+      let fileBuffer;
+      try {
+        fileBuffer = await fs.promises.readFile(filePath);
+      } catch (readError) {
+        logEvent(`❌ Error reading file ${fileName}: ${readError.message}`);
+        return;
+      }
+
+      // Compress the PDF
+      let compressedBuffer;
+      try {
+        logEvent(`🔄 Compressing ${fileName} before upload`);
+        compressedBuffer = await compressPDFInMemory(filePath);
+        const compressionRatio = (((fileBuffer.length - compressedBuffer.length) / fileBuffer.length) * 100).toFixed(2);
+        logEvent(`📊 Compression achieved: ${compressionRatio}% reduction for ${fileName}`);
+      } catch (compressionError) {
+        logEvent(`⚠️ Compression failed for ${fileName}, using original file: ${compressionError}`);
+        compressedBuffer = fileBuffer;
+      }
+
+      // Prepare form data
+      const formData = new FormData();
+      formData.append("files", new Blob([compressedBuffer], { type: "application/pdf" }), fileName);
+
+      logEvent(`📤 Uploading file: ${fileName}`);
+      logCsvEvent({
+        folder: UPLOAD_FOLDER,
+        file: fileName,
+        status: "Info",
+        action: "Upload Started",
+        message: "Initiating upload to system API",
+      });
+
+      // Upload with retry mechanism
+      const response = await retryOperation(async () => {
+        const resp = await fetch(UPLOAD_API_URL, {
+          method: "POST",
+          body: formData,
+          timeout: 30000, // 30 second timeout
+        });
+
+        if (!resp.ok) {
+          throw new Error(`Upload failed with status: ${resp.status}`);
+        }
+
+        return resp;
+      });
+
+      const result = await response.json();
+
+      if (!result) {
+        throw new Error("Invalid response from upload API");
+      }
+
+      // Move to success folder
+      const successPath = path.join(SYSTEM_UPLOADED, fileName);
+      if (await safelyMoveFile(filePath, successPath)) {
+        logEvent(`✅ Successfully uploaded ${fileName}`);
+        logCsvEvent({
+          folder: UPLOAD_FOLDER,
+          file: fileName,
+          status: "Pass",
+          action: "Upload Complete",
+          message: "File uploaded successfully",
+        });
+      }
+    } catch (error) {
+      logEvent(`❌ Error processing ${fileName}: ${error.message}`);
+      logCsvEvent({
+        folder: UPLOAD_FOLDER,
+        file: fileName,
+        status: "Fail",
+        action: "Upload Failed",
+        message: error.toString(),
+      });
+
+      // Move to error folder
+      const errorPath = path.join(UPLOAD_ERROR, fileName);
+      if (await safelyMoveFile(filePath, errorPath)) {
+        logEvent(`⚠️ Moved ${fileName} to error folder after failed upload`);
+      }
+    }
   });
 
   uploadWatcher.on("error", (error) => {
@@ -947,10 +1064,10 @@ const main = async () => {
   // scanWatcher();
 
   // // Setup linearized folder watcher (with OCR)
-  setupLinearizedWatcher();
+  // setupLinearizedWatcher();
 
   // // Setup upload folder watcher
-  // setupUploadWatcher();
+  setupUploadWatcher();
 };
 
 main();
