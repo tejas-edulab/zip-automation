@@ -996,21 +996,71 @@ function setupUploadWatcher() {
 
       const result = await response.json();
 
-      if (!result) {
+      if (!result || !result.data) {
         throw new Error("Invalid response from upload API");
       }
 
-      // Move to success folder
-      const successPath = path.join(SYSTEM_UPLOADED, fileName);
-      if (await safelyMoveFile(filePath, successPath)) {
-        logEvent(`✅ Successfully uploaded ${fileName}`);
-        logCsvEvent({
-          folder: UPLOAD_FOLDER,
-          file: fileName,
-          status: "Pass",
-          action: "Upload Complete",
-          message: "File uploaded successfully",
+      // Process the API response
+      const { savedFiles, failedFiles } = result.data;
+
+      // Log the complete API response
+      logEvent(`📋 API Response for ${fileName}:`);
+      logEvent(`Status: ${result.status}`);
+      logEvent(`Message: ${result.message}`);
+      logEvent(`Saved Files: ${JSON.stringify(savedFiles)}`);
+      logEvent(`Failed Files: ${JSON.stringify(failedFiles)}`);
+
+      // Check if the current file was processed successfully
+      if (savedFiles.includes(fileName)) {
+        // Move to success folder
+        const successPath = path.join(SYSTEM_UPLOADED, fileName);
+        if (await safelyMoveFile(filePath, successPath)) {
+          logEvent(`✅ Successfully uploaded ${fileName}`);
+          logCsvEvent({
+            folder: UPLOAD_FOLDER,
+            file: fileName,
+            status: "Pass",
+            action: "Upload Complete",
+            message: "File uploaded and processed successfully",
+          });
+        }
+      } else {
+        // Check if file is in failedFiles and extract error message
+        const fileNameWithoutExt = fileName.replace(".pdf", "");
+        const failedEntry = failedFiles.find((entry) => {
+          const [failedFileName] = entry.split(" - ");
+          return failedFileName.trim() === fileNameWithoutExt;
         });
+
+        if (failedEntry) {
+          const [_, errorMessage] = failedEntry.split(" - ");
+          // Move to error folder with the specific error message
+          const errorPath = path.join(UPLOAD_ERROR, fileName);
+          if (await safelyMoveFile(filePath, errorPath)) {
+            logEvent(`❌ Upload processing failed for ${fileName}: ${errorMessage}`);
+            logCsvEvent({
+              folder: UPLOAD_FOLDER,
+              file: fileName,
+              status: "Fail",
+              action: "Upload Failed",
+              message: `API Status: ${result.status}, Message: ${result.message}, Error: ${errorMessage}`,
+            });
+          }
+        } else {
+          // Handle case where file is not found in either list
+          logEvent(`⚠️ Unexpected response for ${fileName}: File not found in response lists`);
+          const errorPath = path.join(UPLOAD_ERROR, fileName);
+          if (await safelyMoveFile(filePath, errorPath)) {
+            logEvent(`⚠️ Moved ${fileName} to error folder due to unexpected response`);
+            logCsvEvent({
+              folder: UPLOAD_FOLDER,
+              file: fileName,
+              status: "Fail",
+              action: "Upload Response",
+              message: `API Status: ${result.status}, Message: ${result.message}, File not found in response lists`,
+            });
+          }
+        }
       }
     } catch (error) {
       logEvent(`❌ Error processing ${fileName}: ${error.message}`);
