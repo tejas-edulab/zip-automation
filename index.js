@@ -735,6 +735,10 @@ const scanWatcher = () => {
 
 // Setup watcher for linearized folder
 function setupLinearizedWatcher() {
+  const OCR_API_URL = process.env.OCR_API_URL || "https://osm-barcode-reader-worker.data-0e9.workers.dev/api/extract";
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 1000;
+
   const linearizedWatcher = chokidar.watch(LINEARIZED_FOLDER, {
     ignoreInitial: false,
     depth: 0,
@@ -743,6 +747,30 @@ function setupLinearizedWatcher() {
       pollInterval: 500,
     },
   });
+
+  // Helper function to retry API calls
+  async function retryOperation(operation, retries = MAX_RETRIES) {
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await operation();
+      } catch (error) {
+        if (i === retries - 1) throw error;
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY * (i + 1)));
+      }
+    }
+  }
+
+  // Helper function to safely move file
+  async function safelyMoveFile(sourcePath, destPath) {
+    try {
+      await fs.promises.access(sourcePath, fs.constants.F_OK);
+      await fs.promises.rename(sourcePath, destPath);
+      return true;
+    } catch (error) {
+      logEvent(`❌ Error moving file ${path.basename(sourcePath)}: ${error.message}`);
+      return false;
+    }
+  }
 
   linearizedWatcher.on("add", async (filePath) => {
     if (!filePath.toLowerCase().endsWith(".pdf")) return;
@@ -760,54 +788,71 @@ function setupLinearizedWatcher() {
       const fileName = path.basename(filePath);
       const fileExtension = path.extname(fileName);
 
-      // Read the file and create a File object for upload
-      const fileBuffer = fs.readFileSync(filePath);
-      const fileObj = new File([fileBuffer], fileName, {
-        type: "application/pdf",
-      });
+      // Read file with error handling
+      let fileBuffer;
+      try {
+        fileBuffer = await fs.promises.readFile(filePath);
+      } catch (readError) {
+        logEvent(`❌ Error reading file ${fileName}: ${readError.message}`);
+        return;
+      }
 
       // Prepare form data for OCR API
       const formData = new FormData();
-      formData.append("file", fileObj);
+      formData.append("file", new Blob([fileBuffer], { type: "application/pdf" }), fileName);
 
       logEvent(`🔍 Performing OCR check on ${fileName}`);
 
-      // Call OCR API
-      const response = await fetch("https://osm-barcode-reader-worker.data-0e9.workers.dev/api/extract", {
-        method: "POST",
-        body: formData,
+      // Call OCR API with retry mechanism
+      const response = await retryOperation(async () => {
+        const resp = await fetch(OCR_API_URL, {
+          method: "POST",
+          body: formData,
+          timeout: 30000, // 30 second timeout
+        });
+
+        if (!resp.ok) {
+          throw new Error(`OCR API returned status ${resp.status}`);
+        }
+
+        return resp;
       });
 
       const result = await response.json();
+
+      if (!result || !result.data) {
+        throw new Error("Invalid response from OCR API");
+      }
+
       logEvent(`📋 OCR Result for ${fileName}: ${JSON.stringify(result.data)}`);
 
       // Check if barcode matches filename
       if (result.data.barcode && result.data.barcode.length > 0 && fileName.replace(fileExtension, "") === result.data.barcode) {
         // Move to upload folder
         const uploadPath = path.join(UPLOAD_FOLDER, fileName);
-        fs.renameSync(filePath, uploadPath);
-
-        logEvent(`✅ Barcode matched for ${fileName}, moved to upload folder`);
-        logCsvEvent({
-          folder: LINEARIZED_FOLDER,
-          file: fileName,
-          status: "Pass",
-          action: "OCR Check & Move",
-          message: `Barcode matched: ${result.data.barcode}, moved to upload folder`,
-        });
+        if (await safelyMoveFile(filePath, uploadPath)) {
+          logEvent(`✅ Barcode matched for ${fileName}, moved to upload folder`);
+          logCsvEvent({
+            folder: LINEARIZED_FOLDER,
+            file: fileName,
+            status: "Pass",
+            action: "OCR Check & Move",
+            message: `Barcode matched: ${result.data.barcode}, moved to upload folder`,
+          });
+        }
       } else {
         // Move to error folder
         const errorPath = path.join(ERROR_FOLDER, fileName);
-        fs.renameSync(filePath, errorPath);
-
-        logEvent(`❌ Barcode mismatch for ${fileName}, moved to error folder`);
-        logCsvEvent({
-          folder: LINEARIZED_FOLDER,
-          file: fileName,
-          status: "Fail",
-          action: "OCR Check",
-          message: `Barcode mismatch or not found. Expected: ${fileName.replace(fileExtension, "")}, Got: ${result.data.barcode || "none"}`,
-        });
+        if (await safelyMoveFile(filePath, errorPath)) {
+          logEvent(`❌ Barcode mismatch for ${fileName}, moved to error folder`);
+          logCsvEvent({
+            folder: LINEARIZED_FOLDER,
+            file: fileName,
+            status: "Fail",
+            action: "OCR Check",
+            message: `Barcode mismatch or not found. Expected: ${fileName.replace(fileExtension, "")}, Got: ${result.data.barcode || "none"}`,
+          });
+        }
       }
     } catch (error) {
       logEvent(`❌ Error processing ${path.basename(filePath)}: ${error.message}`);
@@ -820,13 +865,9 @@ function setupLinearizedWatcher() {
       });
 
       // Move to error folder on processing error
-      try {
-        const errorPath = path.join(ERROR_FOLDER, path.basename(filePath));
-        fs.renameSync(filePath, errorPath);
-        logEvent(`⚠️ Moved ${path.basename(filePath)} to error folder`);
-      } catch (moveErr) {
-        logEvent(`❌ Failed to move file to error folder: ${moveErr}`);
-      }
+      const errorPath = path.join(ERROR_FOLDER, path.basename(filePath));
+      await safelyMoveFile(filePath, errorPath);
+      logEvent(`⚠️ Moved ${path.basename(filePath)} to error folder`);
     }
   });
 
@@ -903,10 +944,10 @@ const main = async () => {
   await promptForFolders();
 
   // Setup Scan Folder Watcher
-  scanWatcher();
+  // scanWatcher();
 
   // // Setup linearized folder watcher (with OCR)
-  // setupLinearizedWatcher();
+  setupLinearizedWatcher();
 
   // // Setup upload folder watcher
   // setupUploadWatcher();
