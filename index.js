@@ -887,7 +887,7 @@ function setupLinearizedWatcher() {
 
 // Setup upload folder watcher
 function setupUploadWatcher() {
-  const UPLOAD_API_URL = process.env.UPLOAD_API_URL || "https://devpahsu.paperevaluation.com/api/v1/assessment/answer-code-bulk";
+  const UPLOAD_API_URL = process.env.UPLOAD_API_URL || "https://pahsu.paperevaluation.com/api/v1/assessment/answer-code-bulk";
   const MAX_RETRIES = 3;
   const RETRY_DELAY = 1000;
 
@@ -1007,26 +1007,27 @@ function setupUploadWatcher() {
       logEvent(`📋 API Response for ${fileName}:`);
       logEvent(`Status: ${result.status}`);
       logEvent(`Message: ${result.message}`);
-      logEvent(`Saved Files: ${JSON.stringify(savedFiles)}`);
-      logEvent(`Failed Files: ${JSON.stringify(failedFiles)}`);
+      logEvent(`Successfully Uploaded Files: ${JSON.stringify(savedFiles)}`);
+      logEvent(`Not Uploaded Files: ${JSON.stringify(failedFiles)}`);
 
-      // Check if the current file was processed successfully
-      if (savedFiles.includes(fileName)) {
+      const fileNameWithoutExt = fileName.replace(".pdf", "");
+
+      // Check if the current file was successfully uploaded
+      if (savedFiles.includes(fileNameWithoutExt)) {
         // Move to success folder
         const successPath = path.join(SYSTEM_UPLOADED, fileName);
         if (await safelyMoveFile(filePath, successPath)) {
-          logEvent(`✅ Successfully uploaded ${fileName}`);
+          logEvent(`✅ File ${fileName} was successfully uploaded to system`);
           logCsvEvent({
             folder: UPLOAD_FOLDER,
             file: fileName,
             status: "Pass",
             action: "Upload Complete",
-            message: "File uploaded and processed successfully",
+            message: "File successfully uploaded to system",
           });
         }
       } else {
         // Check if file is in failedFiles and extract error message
-        const fileNameWithoutExt = fileName.replace(".pdf", "");
         const failedEntry = failedFiles.find((entry) => {
           const [failedFileName] = entry.split(" - ");
           return failedFileName.trim() === fileNameWithoutExt;
@@ -1037,27 +1038,27 @@ function setupUploadWatcher() {
           // Move to error folder with the specific error message
           const errorPath = path.join(UPLOAD_ERROR, fileName);
           if (await safelyMoveFile(filePath, errorPath)) {
-            logEvent(`❌ Upload processing failed for ${fileName}: ${errorMessage}`);
+            logEvent(`❌ File ${fileName} was not uploaded: ${errorMessage}`);
             logCsvEvent({
               folder: UPLOAD_FOLDER,
               file: fileName,
               status: "Fail",
-              action: "Upload Failed",
-              message: `API Status: ${result.status}, Message: ${result.message}, Error: ${errorMessage}`,
+              action: "Not Uploaded",
+              message: `File was not uploaded - ${errorMessage}`,
             });
           }
         } else {
           // Handle case where file is not found in either list
-          logEvent(`⚠️ Unexpected response for ${fileName}: File not found in response lists`);
+          logEvent(`⚠️ File ${fileName} status unknown: Not found in upload response lists`);
           const errorPath = path.join(UPLOAD_ERROR, fileName);
           if (await safelyMoveFile(filePath, errorPath)) {
-            logEvent(`⚠️ Moved ${fileName} to error folder due to unexpected response`);
+            logEvent(`⚠️ Moved ${fileName} to error folder due to unknown upload status`);
             logCsvEvent({
               folder: UPLOAD_FOLDER,
               file: fileName,
               status: "Fail",
-              action: "Upload Response",
-              message: `API Status: ${result.status}, Message: ${result.message}, File not found in response lists`,
+              action: "Upload Status Unknown",
+              message: `File not found in upload response lists - Status: ${result.status}, Message: ${result.message}`,
             });
           }
         }
@@ -1111,10 +1112,10 @@ const main = async () => {
   await promptForFolders();
 
   // Setup Scan Folder Watcher
-  // scanWatcher();
+  scanWatcher();
 
   // // Setup linearized folder watcher (with OCR)
-  // setupLinearizedWatcher();
+  setupLinearizedWatcher();
 
   // // Setup upload folder watcher
   setupUploadWatcher();

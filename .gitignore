@@ -13,3 +13,6 @@ UPLOAD_FOLDER/
 UPLOAD_ERROR/
 SYSTEM_UPLOADED/
 .DS_Store
+pdf-report.csv
+scan-log.csv
+.DS_Store
