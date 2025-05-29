@@ -734,17 +734,16 @@ const scanWatcher = () => {
 };
 
 
-const currentIndex = 0;
+let currentIndex = 0;
 
 const getOSM_API_URL = () => {
-  currentIndex = (currentIndex + 1) % 4;
-
   const OCR_API_URLS = [
     "https://osm-barcode-reader-worker.data-0e9.workers.dev/api/extract",
-    "https://osm-barcode-reader-worker1.data-0e9.workers.dev/api/extract",
     "https://osm-barcode-reader-worker2.data-0e9.workers.dev/api/extract",
     "https://osm-barcode-reader-worker3.data-0e9.workers.dev/api/extract",
   ];
+
+  currentIndex = (currentIndex + 1) % OCR_API_URLS.length;
 
   return OCR_API_URLS[currentIndex];
 };
@@ -1129,14 +1128,14 @@ const main = async () => {
   // Ask user for folder input
   await promptForFolders();
 
-  // Setup Scan Folder Watcher
-  scanWatcher();
+  // // Setup Scan Folder Watcher
+  // scanWatcher();
 
   // // Setup linearized folder watcher (with OCR)
   setupLinearizedWatcher();
 
-  // // Setup upload folder watcher
-  setupUploadWatcher();
+  // // // Setup upload folder watcher
+  // setupUploadWatcher();
 };
 
 main();
