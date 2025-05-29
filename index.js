@@ -733,9 +733,25 @@ const scanWatcher = () => {
   logCsvEvent({ folder: SCANNED_FOLDER, file: "", status: "Info", action: "Watcher Started", message: "Started watching scanned folder for PDFs and folders" });
 };
 
+
+const currentIndex = 0;
+
+const getOSM_API_URL = () => {
+  currentIndex = (currentIndex + 1) % 4;
+
+  const OCR_API_URLS = [
+    "https://osm-barcode-reader-worker.data-0e9.workers.dev/api/extract",
+    "https://osm-barcode-reader-worker1.data-0e9.workers.dev/api/extract",
+    "https://osm-barcode-reader-worker2.data-0e9.workers.dev/api/extract",
+    "https://osm-barcode-reader-worker3.data-0e9.workers.dev/api/extract",
+  ];
+
+  return OCR_API_URLS[currentIndex];
+};
+
 // Setup watcher for linearized folder
 function setupLinearizedWatcher() {
-  const OCR_API_URL = process.env.OCR_API_URL || "https://osm-barcode-reader-worker.data-0e9.workers.dev/api/extract";
+  const OCR_API_URL = getOSM_API_URL();
   const MAX_RETRIES = 3;
   const RETRY_DELAY = 1000;
 
@@ -801,7 +817,9 @@ function setupLinearizedWatcher() {
       const formData = new FormData();
       formData.append("file", new Blob([fileBuffer], { type: "application/pdf" }), fileName);
 
-      logEvent(`🔍 Performing OCR check on ${fileName}`);
+      // Get next OCR API URL in round-robin fashion
+      const OCR_API_URL = getOSM_API_URL();
+      logEvent(`🔍 Performing OCR check on ${fileName} using ${OCR_API_URL}`);
 
       // Call OCR API with retry mechanism
       const response = await retryOperation(async () => {
