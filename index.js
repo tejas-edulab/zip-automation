@@ -1129,13 +1129,13 @@ const main = async () => {
   await promptForFolders();
 
   // // Setup Scan Folder Watcher
-  // scanWatcher();
+  scanWatcher();
 
   // // Setup linearized folder watcher (with OCR)
   setupLinearizedWatcher();
 
   // // // Setup upload folder watcher
-  // setupUploadWatcher();
+  setupUploadWatcher();
 };
 
 main();
