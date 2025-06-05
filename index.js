@@ -739,6 +739,7 @@ let currentIndex = 0;
 const getOSM_API_URL = () => {
   const OCR_API_URLS = [
     "https://osm-barcode-reader-worker.data-0e9.workers.dev/api/extract",
+    "https://osm-barcode-reader-worker1.data-0e9.workers.dev/api/extract",
     "https://osm-barcode-reader-worker2.data-0e9.workers.dev/api/extract",
     "https://osm-barcode-reader-worker3.data-0e9.workers.dev/api/extract",
   ];
