@@ -1005,14 +1005,41 @@ function setupUploadWatcher() {
           timeout: 30000, // 30 second timeout
         });
 
-        if (!resp.ok) {
-          throw new Error(`Upload failed with status: ${resp.status}`);
-        }
+        // if (!resp.ok) {
+        //   throw new Error(`Upload failed with status: ${resp.status}`);
+        // }
 
         return resp;
       });
 
       const result = await response.json();
+
+      // Check for specific error codes
+      if (response.status === 422) {
+        // Move to Assessment Not Created folder
+        const errorFolder = path.join(UPLOAD_ERROR, "Assessment Not Created");
+        if (!fs.existsSync(errorFolder)) {
+          fs.mkdirSync(errorFolder, { recursive: true });
+        }
+        const errorPath = path.join(errorFolder, fileName);
+        if (await safelyMoveFile(filePath, errorPath)) {
+          logEvent(`⚠️ Assessment not created for ${fileName}`);
+          return;
+        }
+      }
+
+      if (response.status === 400) {
+        // Move to Already Uploaded folder
+        const errorFolder = path.join(UPLOAD_ERROR, "Already Uploaded");
+        if (!fs.existsSync(errorFolder)) {
+          fs.mkdirSync(errorFolder, { recursive: true });
+        }
+        const errorPath = path.join(errorFolder, fileName);
+        if (await safelyMoveFile(filePath, errorPath)) {
+          logEvent(`⚠️ File ${fileName} was already uploaded`);
+          return;
+        }
+      }
 
       if (!result || !result.data) {
         throw new Error("Invalid response from upload API");
@@ -1021,12 +1048,44 @@ function setupUploadWatcher() {
       // Process the API response
       const { savedFiles, failedFiles } = result.data;
 
+      console.log("Failed Files: ", failedFiles);
+
       // Log the complete API response
       logEvent(`📋 API Response for ${fileName}:`);
       logEvent(`Status: ${result.status}`);
       logEvent(`Message: ${result.message}`);
       logEvent(`Successfully Uploaded Files: ${JSON.stringify(savedFiles)}`);
       logEvent(`Not Uploaded Files: ${JSON.stringify(failedFiles)}`);
+
+      // Process failed files to determine error type and move to appropriate folder
+      if (failedFiles && failedFiles.length > 0) {
+        failedFiles.forEach(async (failedFile) => {
+          const errorMessage = failedFile.Error;
+          if (errorMessage) {
+            const [_, errorType] = errorMessage.split(" - ");
+            if (errorType) {
+              // Create error-specific folder if it doesn't exist
+              const errorTypeFolder = path.join(UPLOAD_ERROR, errorType.trim());
+              if (!fs.existsSync(errorTypeFolder)) {
+                fs.mkdirSync(errorTypeFolder, { recursive: true });
+              }
+
+              // Move file to error-specific folder
+              const errorPath = path.join(errorTypeFolder, fileName);
+              if (await safelyMoveFile(filePath, errorPath)) {
+                logEvent(`⚠️ Moved ${fileName} to error folder: ${errorType}`);
+                logCsvEvent({
+                  folder: UPLOAD_ERROR,
+                  file: fileName,
+                  status: "Fail",
+                  action: "Upload Failed",
+                  message: `Moved to ${errorType} folder: ${errorMessage}`,
+                });
+              }
+            }
+          }
+        });
+      }
 
       const fileNameWithoutExt = fileName.replace(".pdf", "");
 
