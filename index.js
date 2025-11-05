@@ -2,6 +2,7 @@ import inquirer from "inquirer";
 import fs from "fs";
 import path from "path";
 import chokidar from "chokidar";
+import PQueue from "p-queue";
 import os from "os";
 import { exec } from "child_process";
 import archiver from "archiver";
@@ -111,6 +112,27 @@ async function promptForFolders() {
       default: DEFAULT_PATHS.LINEARIZED_FOLDER,
       validate: (input) => (fs.existsSync(input) && fs.lstatSync(input).isDirectory()) || "Invalid folder path",
     },
+    {
+      type: "number",
+      name: "scanConcurrency",
+      message: "👥 Enter concurrency for scan queue (1-5):",
+      default: 2,
+      validate: (input) => (input >= 1 && input <= 5) || "Please enter a number between 1 and 5",
+    },
+    {
+      type: "number",
+      name: "linearizedConcurrency",
+      message: "👥 Enter concurrency for linearized queue (1-5):",
+      default: 2,
+      validate: (input) => (input >= 1 && input <= 5) || "Please enter a number between 1 and 5",
+    },
+    {
+      type: "number",
+      name: "uploadConcurrency",
+      message: "👥 Enter concurrency for upload queue (1-5):",
+      default: 2,
+      validate: (input) => (input >= 1 && input <= 5) || "Please enter a number between 1 and 5",
+    },
   ]);
 
   SCANNED_FOLDER = responses.scanned;
@@ -119,6 +141,13 @@ async function promptForFolders() {
   SCANNER_NAME = responses.scanner;
   PC_NAME = responses.pc;
   LINEARIZED_FOLDER = responses.linearized;
+
+  // Store concurrency settings globally
+  global.QUEUE_CONCURRENCY = {
+    scan: responses.scanConcurrency,
+    linearized: responses.linearizedConcurrency,
+    upload: responses.uploadConcurrency,
+  };
 
   // Create additional folders if they don't exist
   [UPLOAD_FOLDER, ERROR_FOLDER, SYSTEM_UPLOADED, UPLOAD_ERROR].forEach((folder) => {
@@ -699,13 +728,14 @@ async function handleNewPDF(filePath) {
 }
 
 const scanWatcher = () => {
+  const scanQueue = new PQueue({ concurrency: global.QUEUE_CONCURRENCY.scan });
   // Setup all watchers
   const scanWatcher = chokidar.watch(SCANNED_FOLDER, {
     ignoreInitial: false,
     depth: 0,
     awaitWriteFinish: {
-      stabilityThreshold: 10000,
-      pollInterval: 500,
+      stabilityThreshold: 20000,
+      pollInterval: 200,
     },
     ignored: /(^|[\/\\])\../, // Ignore hidden files
   });
@@ -720,7 +750,7 @@ const scanWatcher = () => {
   // Handle new PDF files
   scanWatcher.on("add", (filePath) => {
     if (path.dirname(filePath) === SCANNED_FOLDER && filePath.toLowerCase().endsWith(".pdf")) {
-      handleNewPDF(filePath);
+      scanQueue.add(() => handleNewPDF(filePath));
     }
   });
 
@@ -732,7 +762,6 @@ const scanWatcher = () => {
   logEvent(`📡 Watching folder: ${SCANNED_FOLDER}`);
   logCsvEvent({ folder: SCANNED_FOLDER, file: "", status: "Info", action: "Watcher Started", message: "Started watching scanned folder for PDFs and folders" });
 };
-
 
 let currentIndex = 0;
 
@@ -751,6 +780,7 @@ const getOSM_API_URL = () => {
 
 // Setup watcher for linearized folder
 function setupLinearizedWatcher() {
+  const linearizedQueue = new PQueue({ concurrency: global.QUEUE_CONCURRENCY.linearized });
   const OCR_API_URL = getOSM_API_URL();
   const MAX_RETRIES = 3;
   const RETRY_DELAY = 1000;
@@ -760,7 +790,7 @@ function setupLinearizedWatcher() {
     depth: 0,
     awaitWriteFinish: {
       stabilityThreshold: 2000,
-      pollInterval: 500,
+      pollInterval: 200,
     },
   });
 
@@ -790,103 +820,91 @@ function setupLinearizedWatcher() {
 
   linearizedWatcher.on("add", async (filePath) => {
     if (!filePath.toLowerCase().endsWith(".pdf")) return;
-
-    logEvent(`📄 New file detected in linearized folder: ${path.basename(filePath)}`);
-
-    // Check internet connection first
-    const isOnline = await checkInternetConnection();
-    if (!isOnline) {
-      logEvent("⚠️ No internet connection, skipping OCR check...");
-      return;
-    }
-
-    try {
-      const fileName = path.basename(filePath);
-      const fileExtension = path.extname(fileName);
-
-      // Read file with error handling
-      let fileBuffer;
-      try {
-        fileBuffer = await fs.promises.readFile(filePath);
-      } catch (readError) {
-        logEvent(`❌ Error reading file ${fileName}: ${readError.message}`);
+    linearizedQueue.add(async () => {
+      logEvent(`📄 New file detected in linearized folder: ${path.basename(filePath)}`);
+      // Check internet connection first
+      const isOnline = await checkInternetConnection();
+      if (!isOnline) {
+        logEvent("⚠️ No internet connection, skipping OCR check...");
         return;
       }
-
-      // Prepare form data for OCR API
-      const formData = new FormData();
-      formData.append("file", new Blob([fileBuffer], { type: "application/pdf" }), fileName);
-
-      // Get next OCR API URL in round-robin fashion
-      const OCR_API_URL = getOSM_API_URL();
-      logEvent(`🔍 Performing OCR check on ${fileName} using ${OCR_API_URL}`);
-
-      // Call OCR API with retry mechanism
-      const response = await retryOperation(async () => {
-        const resp = await fetch(OCR_API_URL, {
-          method: "POST",
-          body: formData,
-          timeout: 30000, // 30 second timeout
+      try {
+        const fileName = path.basename(filePath);
+        const fileExtension = path.extname(fileName);
+        // Read file with error handling
+        let fileBuffer;
+        try {
+          fileBuffer = await fs.promises.readFile(filePath);
+        } catch (readError) {
+          logEvent(`❌ Error reading file ${fileName}: ${readError.message}`);
+          return;
+        }
+        // Prepare form data for OCR API
+        const formData = new FormData();
+        formData.append("file", new Blob([fileBuffer], { type: "application/pdf" }), fileName);
+        // Get next OCR API URL in round-robin fashion
+        const OCR_API_URL = getOSM_API_URL();
+        logEvent(`🔍 Performing OCR check on ${fileName} using ${OCR_API_URL}`);
+        // Call OCR API with retry mechanism
+        const response = await retryOperation(async () => {
+          const resp = await fetch(OCR_API_URL, {
+            method: "POST",
+            body: formData,
+            timeout: 30000, // 30 second timeout
+          });
+          if (!resp.ok) {
+            throw new Error(`OCR API returned status ${resp.status}`);
+          }
+          return resp;
         });
-
-        if (!resp.ok) {
-          throw new Error(`OCR API returned status ${resp.status}`);
+        const result = await response.json();
+        if (!result || !result.data) {
+          throw new Error("Invalid response from OCR API");
         }
-
-        return resp;
-      });
-
-      const result = await response.json();
-
-      if (!result || !result.data) {
-        throw new Error("Invalid response from OCR API");
+        logEvent(`📋 OCR Result for ${fileName}: ${JSON.stringify(result.data)}`);
+        // Check if barcode matches filename
+        if (result.data.barcode && result.data.barcode.length > 0 && fileName.replace(fileExtension, "") === result.data.barcode) {
+          // Move to upload folder
+          const uploadPath = path.join(UPLOAD_FOLDER, fileName);
+          if (await safelyMoveFile(filePath, uploadPath)) {
+            logEvent(`✅ Barcode matched for ${fileName}, moved to upload folder`);
+            logCsvEvent({
+              folder: LINEARIZED_FOLDER,
+              file: fileName,
+              status: "Pass",
+              action: "OCR Check & Move",
+              message: `Barcode matched: ${result.data.barcode}, moved to upload folder`,
+            });
+          }
+        } else {
+          // Move to error folder
+          const errorPath = path.join(ERROR_FOLDER, fileName);
+          if (await safelyMoveFile(filePath, errorPath)) {
+            logEvent(`❌ Barcode mismatch for ${fileName}, moved to error folder`);
+            logCsvEvent({
+              folder: LINEARIZED_FOLDER,
+              file: fileName,
+              status: "Fail",
+              action: "OCR Check",
+              message: `Barcode mismatch or not found. Expected: ${fileName.replace(fileExtension, "")}, Got: ${result.data.barcode || "none"}`,
+            });
+          }
+        }
+      } catch (error) {
+        logEvent(`❌ Error processing ${path.basename(filePath)}: ${error.message}`);
+        logCsvEvent({
+          folder: LINEARIZED_FOLDER,
+          file: path.basename(filePath),
+          status: "Fail",
+          action: "Process File",
+          message: error.toString(),
+        });
+        // Move to error folder on processing error
+        const errorPath = path.join(ERROR_FOLDER, path.basename(filePath));
+        await safelyMoveFile(filePath, errorPath);
+        logEvent(`⚠️ Moved ${path.basename(filePath)} to error folder`);
       }
-
-      logEvent(`📋 OCR Result for ${fileName}: ${JSON.stringify(result.data)}`);
-
-      // Check if barcode matches filename
-      if (result.data.barcode && result.data.barcode.length > 0 && fileName.replace(fileExtension, "") === result.data.barcode) {
-        // Move to upload folder
-        const uploadPath = path.join(UPLOAD_FOLDER, fileName);
-        if (await safelyMoveFile(filePath, uploadPath)) {
-          logEvent(`✅ Barcode matched for ${fileName}, moved to upload folder`);
-          logCsvEvent({
-            folder: LINEARIZED_FOLDER,
-            file: fileName,
-            status: "Pass",
-            action: "OCR Check & Move",
-            message: `Barcode matched: ${result.data.barcode}, moved to upload folder`,
-          });
-        }
-      } else {
-        // Move to error folder
-        const errorPath = path.join(ERROR_FOLDER, fileName);
-        if (await safelyMoveFile(filePath, errorPath)) {
-          logEvent(`❌ Barcode mismatch for ${fileName}, moved to error folder`);
-          logCsvEvent({
-            folder: LINEARIZED_FOLDER,
-            file: fileName,
-            status: "Fail",
-            action: "OCR Check",
-            message: `Barcode mismatch or not found. Expected: ${fileName.replace(fileExtension, "")}, Got: ${result.data.barcode || "none"}`,
-          });
-        }
-      }
-    } catch (error) {
-      logEvent(`❌ Error processing ${path.basename(filePath)}: ${error.message}`);
-      logCsvEvent({
-        folder: LINEARIZED_FOLDER,
-        file: path.basename(filePath),
-        status: "Fail",
-        action: "Process File",
-        message: error.toString(),
-      });
-
-      // Move to error folder on processing error
-      const errorPath = path.join(ERROR_FOLDER, path.basename(filePath));
-      await safelyMoveFile(filePath, errorPath);
-      logEvent(`⚠️ Moved ${path.basename(filePath)} to error folder`);
-    }
+    });
   });
 
   linearizedWatcher.on("error", (error) => {
@@ -905,6 +923,7 @@ function setupLinearizedWatcher() {
 
 // Setup upload folder watcher
 function setupUploadWatcher() {
+  const uploadQueue = new PQueue({ concurrency: global.QUEUE_CONCURRENCY.upload });
   const UPLOAD_API_URL = process.env.UPLOAD_API_URL || "https://pahsu.paperevaluation.com/api/v1/assessment/answer-code-bulk";
   const MAX_RETRIES = 3;
   const RETRY_DELAY = 1000;
@@ -945,217 +964,197 @@ function setupUploadWatcher() {
     depth: 0,
     awaitWriteFinish: {
       stabilityThreshold: 2000,
-      pollInterval: 500,
+      pollInterval: 200,
     },
   });
 
   uploadWatcher.on("add", async (filePath) => {
     if (!filePath.toLowerCase().endsWith(".pdf")) return;
-
-    const fileName = path.basename(filePath);
-    logEvent(`📄 New file detected in upload folder: ${fileName}`);
-
-    // Check internet connection first
-    const isOnline = await checkInternetConnection();
-    if (!isOnline) {
-      logEvent("⚠️ No internet connection, skipping upload...");
-      return;
-    }
-
-    try {
-      // Read file with error handling
-      let fileBuffer;
-      try {
-        fileBuffer = await fs.promises.readFile(filePath);
-      } catch (readError) {
-        logEvent(`❌ Error reading file ${fileName}: ${readError.message}`);
+    uploadQueue.add(async () => {
+      const fileName = path.basename(filePath);
+      logEvent(`📄 New file detected in upload folder: ${fileName}`);
+      // Check internet connection first
+      const isOnline = await checkInternetConnection();
+      if (!isOnline) {
+        logEvent("⚠️ No internet connection, skipping upload...");
         return;
       }
-
-      // Compress the PDF
-      let compressedBuffer;
       try {
-        logEvent(`🔄 Compressing ${fileName} before upload`);
-        compressedBuffer = await compressPDFInMemory(filePath);
-        const compressionRatio = (((fileBuffer.length - compressedBuffer.length) / fileBuffer.length) * 100).toFixed(2);
-        logEvent(`📊 Compression achieved: ${compressionRatio}% reduction for ${fileName}`);
-      } catch (compressionError) {
-        logEvent(`⚠️ Compression failed for ${fileName}, using original file: ${compressionError}`);
-        compressedBuffer = fileBuffer;
-      }
-
-      // Prepare form data
-      const formData = new FormData();
-      formData.append("files", new Blob([compressedBuffer], { type: "application/pdf" }), fileName);
-
-      logEvent(`📤 Uploading file: ${fileName}`);
-      logCsvEvent({
-        folder: UPLOAD_FOLDER,
-        file: fileName,
-        status: "Info",
-        action: "Upload Started",
-        message: "Initiating upload to system API",
-      });
-
-      // Upload with retry mechanism
-      const response = await retryOperation(async () => {
-        const resp = await fetch(UPLOAD_API_URL, {
-          method: "POST",
-          body: formData,
-          timeout: 30000, // 30 second timeout
+        // Read file with error handling
+        let fileBuffer;
+        try {
+          fileBuffer = await fs.promises.readFile(filePath);
+        } catch (readError) {
+          logEvent(`❌ Error reading file ${fileName}: ${readError.message}`);
+          return;
+        }
+        // Compress the PDF
+        let compressedBuffer;
+        try {
+          logEvent(`🔄 Compressing ${fileName} before upload`);
+          compressedBuffer = await compressPDFInMemory(filePath);
+          const compressionRatio = (((fileBuffer.length - compressedBuffer.length) / fileBuffer.length) * 100).toFixed(2);
+          logEvent(`📊 Compression achieved: ${compressionRatio}% reduction for ${fileName}`);
+        } catch (compressionError) {
+          logEvent(`⚠️ Compression failed for ${fileName}, using original file: ${compressionError}`);
+          compressedBuffer = fileBuffer;
+        }
+        // Prepare form data
+        const formData = new FormData();
+        formData.append("files", new Blob([compressedBuffer], { type: "application/pdf" }), fileName);
+        logEvent(`📤 Uploading file: ${fileName}`);
+        logCsvEvent({
+          folder: UPLOAD_FOLDER,
+          file: fileName,
+          status: "Info",
+          action: "Upload Started",
+          message: "Initiating upload to system API",
         });
-
-        // if (!resp.ok) {
-        //   throw new Error(`Upload failed with status: ${resp.status}`);
-        // }
-
-        return resp;
-      });
-
-      const result = await response.json();
-
-      // Check for specific error codes
-      if (response.status === 422) {
-        // Move to Assessment Not Created folder
-        const errorFolder = path.join(UPLOAD_ERROR, "Assessment Not Created");
-        if (!fs.existsSync(errorFolder)) {
-          fs.mkdirSync(errorFolder, { recursive: true });
+        // Upload with retry mechanism
+        const response = await retryOperation(async () => {
+          const resp = await fetch(UPLOAD_API_URL, {
+            method: "POST",
+            body: formData,
+            timeout: 30000, // 30 second timeout
+          });
+          // if (!resp.ok) {
+          //   throw new Error(`Upload failed with status: ${resp.status}`);
+          // }
+          return resp;
+        });
+        const result = await response.json();
+        // Check for specific error codes
+        if (response.status === 422) {
+          // Move to Assessment Not Created folder
+          const errorFolder = path.join(UPLOAD_ERROR, "Assessment Not Created");
+          if (!fs.existsSync(errorFolder)) {
+            fs.mkdirSync(errorFolder, { recursive: true });
+          }
+          const errorPath = path.join(errorFolder, fileName);
+          if (await safelyMoveFile(filePath, errorPath)) {
+            logEvent(`⚠️ Assessment not created for ${fileName}`);
+            return;
+          }
         }
-        const errorPath = path.join(errorFolder, fileName);
-        if (await safelyMoveFile(filePath, errorPath)) {
-          logEvent(`⚠️ Assessment not created for ${fileName}`);
-          return;
+        if (response.status === 400) {
+          // Move to Already Uploaded folder
+          const errorFolder = path.join(UPLOAD_ERROR, "Already Uploaded");
+          if (!fs.existsSync(errorFolder)) {
+            fs.mkdirSync(errorFolder, { recursive: true });
+          }
+          const errorPath = path.join(errorFolder, fileName);
+          if (await safelyMoveFile(filePath, errorPath)) {
+            logEvent(`⚠️ File ${fileName} was already uploaded`);
+            return;
+          }
         }
-      }
-
-      if (response.status === 400) {
-        // Move to Already Uploaded folder
-        const errorFolder = path.join(UPLOAD_ERROR, "Already Uploaded");
-        if (!fs.existsSync(errorFolder)) {
-          fs.mkdirSync(errorFolder, { recursive: true });
+        if (!result || !result.data) {
+          throw new Error("Invalid response from upload API");
         }
-        const errorPath = path.join(errorFolder, fileName);
-        if (await safelyMoveFile(filePath, errorPath)) {
-          logEvent(`⚠️ File ${fileName} was already uploaded`);
-          return;
-        }
-      }
-
-      if (!result || !result.data) {
-        throw new Error("Invalid response from upload API");
-      }
-
-      // Process the API response
-      const { savedFiles, failedFiles } = result.data;
-
-      console.log("Failed Files: ", failedFiles);
-
-      // Log the complete API response
-      logEvent(`📋 API Response for ${fileName}:`);
-      logEvent(`Status: ${result.status}`);
-      logEvent(`Message: ${result.message}`);
-      logEvent(`Successfully Uploaded Files: ${JSON.stringify(savedFiles)}`);
-      logEvent(`Not Uploaded Files: ${JSON.stringify(failedFiles)}`);
-
-      // Process failed files to determine error type and move to appropriate folder
-      if (failedFiles && failedFiles.length > 0) {
-        failedFiles.forEach(async (failedFile) => {
-          const errorMessage = failedFile.Error;
-          if (errorMessage) {
-            const [_, errorType] = errorMessage.split(" - ");
-            if (errorType) {
-              // Create error-specific folder if it doesn't exist
-              const errorTypeFolder = path.join(UPLOAD_ERROR, errorType.trim());
-              if (!fs.existsSync(errorTypeFolder)) {
-                fs.mkdirSync(errorTypeFolder, { recursive: true });
-              }
-
-              // Move file to error-specific folder
-              const errorPath = path.join(errorTypeFolder, fileName);
-              if (await safelyMoveFile(filePath, errorPath)) {
-                logEvent(`⚠️ Moved ${fileName} to error folder: ${errorType}`);
-                logCsvEvent({
-                  folder: UPLOAD_ERROR,
-                  file: fileName,
-                  status: "Fail",
-                  action: "Upload Failed",
-                  message: `Moved to ${errorType} folder: ${errorMessage}`,
-                });
+        // Process the API response
+        const { savedFiles, failedFiles } = result.data;
+        console.log("Failed Files: ", failedFiles);
+        // Log the complete API response
+        logEvent(`📋 API Response for ${fileName}:`);
+        logEvent(`Status: ${result.status}`);
+        logEvent(`Message: ${result.message}`);
+        logEvent(`Successfully Uploaded Files: ${JSON.stringify(savedFiles)}`);
+        logEvent(`Not Uploaded Files: ${JSON.stringify(failedFiles)}`);
+        // Process failed files to determine error type and move to appropriate folder
+        if (failedFiles && failedFiles.length > 0) {
+          failedFiles.forEach(async (failedFile) => {
+            const errorMessage = failedFile.Error;
+            if (errorMessage) {
+              const [_, errorType] = errorMessage.split(" - ");
+              if (errorType) {
+                // Create error-specific folder if it doesn't exist
+                const errorTypeFolder = path.join(UPLOAD_ERROR, errorType.trim());
+                if (!fs.existsSync(errorTypeFolder)) {
+                  fs.mkdirSync(errorTypeFolder, { recursive: true });
+                }
+                // Move file to error-specific folder
+                const errorPath = path.join(errorTypeFolder, fileName);
+                if (await safelyMoveFile(filePath, errorPath)) {
+                  logEvent(`⚠️ Moved ${fileName} to error folder: ${errorType}`);
+                  logCsvEvent({
+                    folder: UPLOAD_ERROR,
+                    file: fileName,
+                    status: "Fail",
+                    action: "Upload Failed",
+                    message: `Moved to ${errorType} folder: ${errorMessage}`,
+                  });
+                }
               }
             }
-          }
-        });
-      }
-
-      const fileNameWithoutExt = fileName.replace(".pdf", "");
-
-      // Check if the current file was successfully uploaded
-      if (savedFiles.includes(fileNameWithoutExt)) {
-        // Move to success folder
-        const successPath = path.join(SYSTEM_UPLOADED, fileName);
-        if (await safelyMoveFile(filePath, successPath)) {
-          logEvent(`✅ File ${fileName} was successfully uploaded to system`);
-          logCsvEvent({
-            folder: UPLOAD_FOLDER,
-            file: fileName,
-            status: "Pass",
-            action: "Upload Complete",
-            message: "File successfully uploaded to system",
           });
         }
-      } else {
-        // Check if file is in failedFiles and extract error message
-        const failedEntry = failedFiles.find((entry) => {
-          const [failedFileName] = entry.split(" - ");
-          return failedFileName.trim() === fileNameWithoutExt;
-        });
-
-        if (failedEntry) {
-          const [_, errorMessage] = failedEntry.split(" - ");
-          // Move to error folder with the specific error message
-          const errorPath = path.join(UPLOAD_ERROR, fileName);
-          if (await safelyMoveFile(filePath, errorPath)) {
-            logEvent(`❌ File ${fileName} was not uploaded: ${errorMessage}`);
+        const fileNameWithoutExt = fileName.replace(".pdf", "");
+        // Check if the current file was successfully uploaded
+        if (savedFiles.includes(fileNameWithoutExt)) {
+          // Move to success folder
+          const successPath = path.join(SYSTEM_UPLOADED, fileName);
+          if (await safelyMoveFile(filePath, successPath)) {
+            logEvent(`✅ File ${fileName} was successfully uploaded to system`);
             logCsvEvent({
               folder: UPLOAD_FOLDER,
               file: fileName,
-              status: "Fail",
-              action: "Not Uploaded",
-              message: `File was not uploaded - ${errorMessage}`,
+              status: "Pass",
+              action: "Upload Complete",
+              message: "File successfully uploaded to system",
             });
           }
         } else {
-          // Handle case where file is not found in either list
-          logEvent(`⚠️ File ${fileName} status unknown: Not found in upload response lists`);
-          const errorPath = path.join(UPLOAD_ERROR, fileName);
-          if (await safelyMoveFile(filePath, errorPath)) {
-            logEvent(`⚠️ Moved ${fileName} to error folder due to unknown upload status`);
-            logCsvEvent({
-              folder: UPLOAD_FOLDER,
-              file: fileName,
-              status: "Fail",
-              action: "Upload Status Unknown",
-              message: `File not found in upload response lists - Status: ${result.status}, Message: ${result.message}`,
-            });
+          // Check if file is in failedFiles and extract error message
+          const failedEntry = failedFiles.find((entry) => {
+            const [failedFileName] = entry.split(" - ");
+            return failedFileName.trim() === fileNameWithoutExt;
+          });
+          if (failedEntry) {
+            const [_, errorMessage] = failedEntry.split(" - ");
+            // Move to error folder with the specific error message
+            const errorPath = path.join(UPLOAD_ERROR, fileName);
+            if (await safelyMoveFile(filePath, errorPath)) {
+              logEvent(`❌ File ${fileName} was not uploaded: ${errorMessage}`);
+              logCsvEvent({
+                folder: UPLOAD_FOLDER,
+                file: fileName,
+                status: "Fail",
+                action: "Not Uploaded",
+                message: `File was not uploaded - ${errorMessage}`,
+              });
+            }
+          } else {
+            // Handle case where file is not found in either list
+            logEvent(`⚠️ File ${fileName} status unknown: Not found in upload response lists`);
+            const errorPath = path.join(UPLOAD_ERROR, fileName);
+            if (await safelyMoveFile(filePath, errorPath)) {
+              logEvent(`⚠️ Moved ${fileName} to error folder due to unknown upload status`);
+              logCsvEvent({
+                folder: UPLOAD_FOLDER,
+                file: fileName,
+                status: "Fail",
+                action: "Upload Status Unknown",
+                message: `File not found in upload response lists - Status: ${result.status}, Message: ${result.message}`,
+              });
+            }
           }
         }
+      } catch (error) {
+        logEvent(`❌ Error processing ${fileName}: ${error.message}`);
+        logCsvEvent({
+          folder: UPLOAD_FOLDER,
+          file: fileName,
+          status: "Fail",
+          action: "Upload Failed",
+          message: error.toString(),
+        });
+        // Move to error folder
+        const errorPath = path.join(UPLOAD_ERROR, fileName);
+        if (await safelyMoveFile(filePath, errorPath)) {
+          logEvent(`⚠️ Moved ${fileName} to error folder after failed upload`);
+        }
       }
-    } catch (error) {
-      logEvent(`❌ Error processing ${fileName}: ${error.message}`);
-      logCsvEvent({
-        folder: UPLOAD_FOLDER,
-        file: fileName,
-        status: "Fail",
-        action: "Upload Failed",
-        message: error.toString(),
-      });
-
-      // Move to error folder
-      const errorPath = path.join(UPLOAD_ERROR, fileName);
-      if (await safelyMoveFile(filePath, errorPath)) {
-        logEvent(`⚠️ Moved ${fileName} to error folder after failed upload`);
-      }
-    }
+    });
   });
 
   uploadWatcher.on("error", (error) => {
