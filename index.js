@@ -215,7 +215,20 @@ function waitForFolderToStabilize(folderPath, durationMs = 3000, interval = 1000
     let stableTime = 0;
 
     const intervalId = setInterval(() => {
-      const files = fs.readdirSync(folderPath).filter((f) => f.toLowerCase().endsWith(".pdf"));
+      if (!fs.existsSync(folderPath)) {
+        clearInterval(intervalId);
+        resolve(); // Folder was deleted, treat as stabilized
+        return;
+      }
+      let files = [];
+      try {
+        files = fs.readdirSync(folderPath).filter((f) => f.toLowerCase().endsWith(".pdf"));
+      } catch (err) {
+        // Folder may have been deleted between existsSync and readdirSync
+        clearInterval(intervalId);
+        resolve();
+        return;
+      }
       const currentCount = files.length;
 
       if (currentCount === previousCount) {
