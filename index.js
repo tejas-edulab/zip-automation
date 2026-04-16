@@ -1281,6 +1281,17 @@ function setupUploadWatcher() {
 
 // Main runner
 const main = async () => {
+  // Verify Ghostscript is installed before doing anything else
+  await new Promise((resolve) => {
+    exec(`"${gsPackage}" --version`, (err) => {
+      if (err) {
+        console.error("❌ Ghostscript not found. Run: node install-ghost-script.js");
+        process.exit(1);
+      }
+      resolve();
+    });
+  });
+
   if (!fs.existsSync(CSV_LOG_FILE)) {
     fs.writeFileSync(CSV_LOG_FILE, "Timestamp,Scanner,PC,Folder,File,Status,Action,Message\n");
   }
