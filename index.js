@@ -9,6 +9,11 @@ import archiver from "archiver";
 import directory from "inquirer-directory";
 import pdf from "pdf-parse";
 import dns from "node:dns";
+import { Logtail } from "@logtail/node";
+
+const logtail = new Logtail("CkKtQHNySpmNvBv7F1fiDRqh", {
+  endpoint: "https://s2366261.eu-fsn-3.betterstackdata.com",
+});
 
 // Initialization
 const CSV_LOG_FILE = "scan-log.csv";
@@ -44,10 +49,17 @@ const logStream = fs.createWriteStream(LOG_FILE, { flags: "a" });
 inquirer.registerPrompt("directory", directory);
 
 // CSV Logger
-function logCsvEvent({ folder, file, status, action, message }) {
+function logCsvEvent({ folder, file, status, action, message, ...extra }) {
   const timestamp = new Date().toISOString();
   const row = `"${timestamp}","${SCANNER_NAME}","${PC_NAME}","${folder}","${file}","${status}","${action}","${message.replace(/"/g, '""')}"\n`;
   fs.appendFileSync(CSV_LOG_FILE, row);
+
+  const meta = { scanner: SCANNER_NAME, pc: PC_NAME, folder, file, action, status, ...extra };
+  if (status === "Fail") {
+    logtail.error(message, meta);
+  } else {
+    logtail.info(message, meta);
+  }
 }
 
 // Check internet connection
@@ -163,6 +175,7 @@ function logEvent(message) {
   const logMessage = `[${timestamp}] ${message}${os.EOL}`;
   console.log(logMessage.trim());
   logStream.write(logMessage);
+  logtail.info(message, { scanner: SCANNER_NAME, pc: PC_NAME });
 }
 
 // Compress PDF
@@ -433,6 +446,17 @@ async function compressPDFInMemory(inputPath) {
     }
     throw err;
   }
+}
+
+// Extract seat number from barcodeSeatNumber field
+// Normal format:      slrCode-slrNumber-SeatNumber          (3 parts)
+// Two-section format: slrCode-slrNumber-Roman-SeatNumber-Roman  (5 parts)
+function extractSeatNumberFromBarcode(barcodeSeatNumber) {
+  if (!barcodeSeatNumber) return null;
+  const parts = barcodeSeatNumber.split("-");
+  if (parts.length === 3) return parts[2];
+  if (parts.length === 5) return parts[3];
+  return null;
 }
 
 // Process files in batches
@@ -875,31 +899,52 @@ function setupLinearizedWatcher() {
           throw new Error("Invalid response from OCR API");
         }
         logEvent(`📋 OCR Result for ${fileName}: ${JSON.stringify(result.data)}`);
-        // Check if barcode matches filename
-        if (result.data.barcode && result.data.barcode.length > 0 && fileName.replace(fileExtension, "") === result.data.barcode) {
+
+        // Verification 1: barcode (ID on sticker) must match the PDF filename
+        const fileNameWithoutExt = fileName.replace(fileExtension, "");
+        const barcodeMatches = result.data.barcode && fileNameWithoutExt === result.data.barcode;
+
+        // Verification 2: seat number derived from barcodeSeatNumber must match seatNumber field
+        const derivedSeatNumber = extractSeatNumberFromBarcode(result.data.barcodeSeatNumber);
+        const seatNumberMatches = derivedSeatNumber && derivedSeatNumber === result.data.seatNumber;
+
+        if (barcodeMatches && seatNumberMatches) {
           // Move to upload folder
           const uploadPath = path.join(UPLOAD_FOLDER, fileName);
           if (await safelyMoveFile(filePath, uploadPath)) {
-            logEvent(`✅ Barcode matched for ${fileName}, moved to upload folder`);
+            logEvent(`✅ OCR verified for ${fileName} — barcode: ${result.data.barcode}, seatNumber: ${result.data.seatNumber}, moved to upload folder`);
             logCsvEvent({
               folder: LINEARIZED_FOLDER,
               file: fileName,
               status: "Pass",
               action: "OCR Check & Move",
-              message: `Barcode matched: ${result.data.barcode}, moved to upload folder`,
+              message: `Barcode matched: ${result.data.barcode}, SeatNumber matched: ${result.data.seatNumber}, moved to upload folder`,
+              barcode: result.data.barcode,
+              seatNumber: result.data.seatNumber,
+              barcodeSeatNumber: result.data.barcodeSeatNumber,
             });
           }
         } else {
+          const failureReason = !barcodeMatches ? "barcode_mismatch" : "seat_number_mismatch";
+          const reason = !barcodeMatches
+            ? `Barcode mismatch — expected: ${fileNameWithoutExt}, got: ${result.data.barcode || "none"}`
+            : `SeatNumber mismatch — derived: ${derivedSeatNumber || "none"} (from ${result.data.barcodeSeatNumber}), got: ${result.data.seatNumber || "none"}`;
           // Move to error folder
           const errorPath = path.join(ERROR_FOLDER, fileName);
           if (await safelyMoveFile(filePath, errorPath)) {
-            logEvent(`❌ Barcode mismatch for ${fileName}, moved to error folder`);
+            logEvent(`❌ OCR verification failed for ${fileName}: ${reason}`);
             logCsvEvent({
               folder: LINEARIZED_FOLDER,
               file: fileName,
               status: "Fail",
               action: "OCR Check",
-              message: `Barcode mismatch or not found. Expected: ${fileName.replace(fileExtension, "")}, Got: ${result.data.barcode || "none"}`,
+              message: reason,
+              failureReason,
+              expectedBarcode: fileNameWithoutExt,
+              gotBarcode: result.data.barcode || null,
+              expectedSeatNumber: result.data.seatNumber || null,
+              gotSeatNumber: derivedSeatNumber || null,
+              barcodeSeatNumber: result.data.barcodeSeatNumber || null,
             });
           }
         }
@@ -1003,11 +1048,20 @@ function setupUploadWatcher() {
         }
         // Compress the PDF
         let compressedBuffer;
+        const fileSizeMB = parseFloat((fileBuffer.length / 1024 / 1024).toFixed(2));
+        let compressedSizeMB = fileSizeMB;
+        let compressionRatio = 0;
         try {
           logEvent(`🔄 Compressing ${fileName} before upload`);
           compressedBuffer = await compressPDFInMemory(filePath);
-          const compressionRatio = (((fileBuffer.length - compressedBuffer.length) / fileBuffer.length) * 100).toFixed(2);
-          logEvent(`📊 Compression achieved: ${compressionRatio}% reduction for ${fileName}`);
+          if (compressedBuffer.length >= fileBuffer.length) {
+            logEvent(`⚠️ Compressed file is larger than original for ${fileName}, using original`);
+            compressedBuffer = fileBuffer;
+          } else {
+            compressionRatio = parseFloat(((fileBuffer.length - compressedBuffer.length) / fileBuffer.length * 100).toFixed(2));
+            compressedSizeMB = parseFloat((compressedBuffer.length / 1024 / 1024).toFixed(2));
+            logEvent(`📊 Compression achieved: ${compressionRatio}% reduction for ${fileName}`);
+          }
         } catch (compressionError) {
           logEvent(`⚠️ Compression failed for ${fileName}, using original file: ${compressionError}`);
           compressedBuffer = fileBuffer;
@@ -1022,6 +1076,9 @@ function setupUploadWatcher() {
           status: "Info",
           action: "Upload Started",
           message: "Initiating upload to system API",
+          fileSizeMB,
+          compressedSizeMB,
+          compressionRatio,
         });
         // Upload with retry mechanism
         const response = await retryOperation(async () => {
@@ -1046,6 +1103,16 @@ function setupUploadWatcher() {
           const errorPath = path.join(errorFolder, fileName);
           if (await safelyMoveFile(filePath, errorPath)) {
             logEvent(`⚠️ Assessment not created for ${fileName}`);
+            logCsvEvent({
+              folder: UPLOAD_ERROR,
+              file: fileName,
+              status: "Fail",
+              action: "Upload Failed",
+              message: "Assessment not created in system",
+              errorType: "Assessment Not Created",
+              httpStatus: 422,
+              fileSizeMB,
+            });
             return;
           }
         }
@@ -1058,6 +1125,16 @@ function setupUploadWatcher() {
           const errorPath = path.join(errorFolder, fileName);
           if (await safelyMoveFile(filePath, errorPath)) {
             logEvent(`⚠️ File ${fileName} was already uploaded`);
+            logCsvEvent({
+              folder: UPLOAD_ERROR,
+              file: fileName,
+              status: "Fail",
+              action: "Upload Failed",
+              message: "File was already uploaded",
+              errorType: "Already Uploaded",
+              httpStatus: 400,
+              fileSizeMB,
+            });
             return;
           }
         }
@@ -1095,6 +1172,8 @@ function setupUploadWatcher() {
                     status: "Fail",
                     action: "Upload Failed",
                     message: `Moved to ${errorType} folder: ${errorMessage}`,
+                    errorType: errorType.trim(),
+                    fileSizeMB,
                   });
                 }
               }
@@ -1114,6 +1193,9 @@ function setupUploadWatcher() {
               status: "Pass",
               action: "Upload Complete",
               message: "File successfully uploaded to system",
+              fileSizeMB,
+              compressedSizeMB,
+              compressionRatio,
             });
           }
         } else {
@@ -1132,8 +1214,10 @@ function setupUploadWatcher() {
                 folder: UPLOAD_FOLDER,
                 file: fileName,
                 status: "Fail",
-                action: "Not Uploaded",
+                action: "Upload Failed",
                 message: `File was not uploaded - ${errorMessage}`,
+                errorType: errorMessage?.trim() || "Unknown",
+                fileSizeMB,
               });
             }
           } else {
@@ -1146,8 +1230,10 @@ function setupUploadWatcher() {
                 folder: UPLOAD_FOLDER,
                 file: fileName,
                 status: "Fail",
-                action: "Upload Status Unknown",
+                action: "Upload Failed",
                 message: `File not found in upload response lists - Status: ${result.status}, Message: ${result.message}`,
+                errorType: "Unknown",
+                fileSizeMB,
               });
             }
           }
@@ -1160,6 +1246,8 @@ function setupUploadWatcher() {
           status: "Fail",
           action: "Upload Failed",
           message: error.toString(),
+          errorType: "Exception",
+          fileSizeMB,
         });
         // Move to error folder
         const errorPath = path.join(UPLOAD_ERROR, fileName);
@@ -1211,4 +1299,14 @@ const main = async () => {
 };
 
 main();
+
+// Flush pending Better Stack logs before process exits
+process.on("SIGINT", async () => {
+  await logtail.flush();
+  process.exit();
+});
+process.on("SIGTERM", async () => {
+  await logtail.flush();
+  process.exit();
+});
 
