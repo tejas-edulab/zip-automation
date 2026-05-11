@@ -7,7 +7,7 @@ import os from "os";
 import { exec } from "child_process";
 import archiver from "archiver";
 import directory from "inquirer-directory";
-import pdf from "pdf-parse";
+import pdf from "pdf-parse/lib/pdf-parse.js";
 import dns from "node:dns";
 import { Logtail } from "@logtail/node";
 
@@ -145,6 +145,13 @@ async function promptForFolders() {
       default: 2,
       validate: (input) => (input >= 1 && input <= 5) || "Please enter a number between 1 and 5",
     },
+    {
+      type: "list",
+      name: "examEvent",
+      message: "📅 Which exam event?",
+      default: "summer_2025-2026",
+      choices: ["summer_2025-2026", "winter_2025-2026"],
+    },
   ]);
 
   SCANNED_FOLDER = responses.scanned;
@@ -160,6 +167,7 @@ async function promptForFolders() {
     linearized: responses.linearizedConcurrency,
     upload: responses.uploadConcurrency,
   };
+  global.EXAM_EVENT = responses.examEvent;
 
   // Create additional folders if they don't exist
   [UPLOAD_FOLDER, ERROR_FOLDER, SYSTEM_UPLOADED, UPLOAD_ERROR].forEach((folder) => {
@@ -192,7 +200,7 @@ function compressPDF(inputPath, outputPath) {
     // - -dBATCH               → Exit after processing (no interactive mode)
     // - -sOutputFile=...      → Output file path
     // - inputPath             → Input file to compress
-    const gsCmd = `"${gsPackage}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dDownsampleColorImages=true -dColorImageResolution=150 -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputPath}"`;
+    const gsCmd = `"${gsPackage}" -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dDownsampleColorImages=true -dColorImageResolution=150 -dDownsampleGrayImages=true -dGrayImageResolution=150 -dDownsampleMonoImages=true -dMonoImageResolution=150 -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputPath}"`;
 
     exec(gsCmd, (error, stdout, stderr) => {
       if (error) {
@@ -280,7 +288,6 @@ async function generatePDFReport(pdfPath) {
       };
       logEvent(`⚠️ PDF parsing warning for ${pdfPath}: ${pdfError.message}`);
 
-      console.log(pdfError);
       throw new Error(pdfError);
     }
 
@@ -288,8 +295,6 @@ async function generatePDFReport(pdfPath) {
     const fileSizeInMB = (fileStats.size / (1024 * 1024)).toFixed(2);
     const baseFolder = path.basename(path.dirname(pdfPath));
     const fileName = path.basename(pdfPath);
-
-    console.log("PDF Data ", pdfData);
 
     const reportData = {
       timestamp: new Date().toISOString(),
@@ -508,7 +513,9 @@ async function uploadToSystem(files) {
 
         // Compare sizes
         const compressionRatio = (((originalSize - compressedBuffer.length) / originalSize) * 100).toFixed(2);
-        logEvent(`📊 Compression achieved: ${compressionRatio}% reduction for ${path.basename(filePath)}`);
+        const originalMB = (originalSize / (1024 * 1024)).toFixed(2);
+        const compressedMB = (compressedBuffer.length / (1024 * 1024)).toFixed(2);
+        logEvent(`📊 ${path.basename(filePath)}: ${originalMB} MB → ${compressedMB} MB (${compressionRatio}% reduction)`);
 
         // Create a Blob from the compressed buffer
         formData.append("files", new Blob([compressedBuffer], { type: "application/pdf" }), path.basename(filePath));
@@ -908,6 +915,16 @@ function setupLinearizedWatcher() {
         const derivedSeatNumber = extractSeatNumberFromBarcode(result.data.barcodeSeatNumber);
         const seatNumberMatches = derivedSeatNumber && derivedSeatNumber === result.data.seatNumber;
 
+        // Debug log: always show the comparison so failures are easy to diagnose
+        const barcodeSeatParts = result.data.barcodeSeatNumber ? result.data.barcodeSeatNumber.split("-") : [];
+        logEvent(
+          `\n🔎 OCR CHECK [${fileName}]\n` +
+          `   ┌─ Barcode check   : expected="${fileNameWithoutExt}"  got="${result.data.barcode || "—"}"  → ${barcodeMatches ? "✅ PASS" : "❌ FAIL"}\n` +
+          `   ├─ barcodeSeatNum  : "${result.data.barcodeSeatNumber || "—"}"  (${barcodeSeatParts.length} parts: [${barcodeSeatParts.join(", ")}])\n` +
+          `   ├─ Derived seat#   : "${derivedSeatNumber || "—"}"  (expected 3 or 5 parts${barcodeSeatParts.length !== 3 && barcodeSeatParts.length !== 5 ? ` — got ${barcodeSeatParts.length}, can't extract!` : ""})\n` +
+          `   └─ SeatNum check  : expected="${derivedSeatNumber || "—"}"  got="${result.data.seatNumber || "—"}"  → ${seatNumberMatches ? "✅ PASS" : "❌ FAIL"}`
+        );
+
         if (barcodeMatches && seatNumberMatches) {
           // Move to upload folder
           const uploadPath = path.join(UPLOAD_FOLDER, fileName);
@@ -925,10 +942,24 @@ function setupLinearizedWatcher() {
             });
           }
         } else {
-          const failureReason = !barcodeMatches ? "barcode_mismatch" : "seat_number_mismatch";
-          const reason = !barcodeMatches
-            ? `Barcode mismatch — expected: ${fileNameWithoutExt}, got: ${result.data.barcode || "none"}`
-            : `SeatNumber mismatch — derived: ${derivedSeatNumber || "none"} (from ${result.data.barcodeSeatNumber}), got: ${result.data.seatNumber || "none"}`;
+          const failureReasons = [];
+          if (!barcodeMatches) failureReasons.push("barcode_mismatch");
+          if (!seatNumberMatches) failureReasons.push("seat_number_mismatch");
+          const failureReason = failureReasons.join("+");
+
+          const reasonParts = [];
+          if (!barcodeMatches)
+            reasonParts.push(`Barcode mismatch — expected: ${fileNameWithoutExt}, got: ${result.data.barcode || "none"}`);
+          if (!seatNumberMatches) {
+            const seatParts = result.data.barcodeSeatNumber ? result.data.barcodeSeatNumber.split("-") : [];
+            const partCountNote = seatParts.length !== 3 && seatParts.length !== 5
+              ? ` [UNRECOGNISED FORMAT: ${seatParts.length} parts]`
+              : "";
+            reasonParts.push(
+              `SeatNumber mismatch — derived: ${derivedSeatNumber || "none"}${partCountNote} (from barcodeSeatNumber="${result.data.barcodeSeatNumber || "none"}"), got seatNumber field: ${result.data.seatNumber || "none"}`
+            );
+          }
+          const reason = reasonParts.join(" | ");
           // Move to error folder
           const errorPath = path.join(ERROR_FOLDER, fileName);
           if (await safelyMoveFile(filePath, errorPath)) {
@@ -1037,6 +1068,8 @@ function setupUploadWatcher() {
         logEvent("⚠️ No internet connection, skipping upload...");
         return;
       }
+      let fileSizeMB = 0;
+      let compressedSizeMB = 0;
       try {
         // Read file with error handling
         let fileBuffer;
@@ -1048,19 +1081,19 @@ function setupUploadWatcher() {
         }
         // Compress the PDF
         let compressedBuffer;
-        const fileSizeMB = parseFloat((fileBuffer.length / 1024 / 1024).toFixed(2));
-        let compressedSizeMB = fileSizeMB;
+        fileSizeMB = parseFloat((fileBuffer.length / 1024 / 1024).toFixed(2));
+        compressedSizeMB = fileSizeMB;
         let compressionRatio = 0;
         try {
           logEvent(`🔄 Compressing ${fileName} before upload`);
           compressedBuffer = await compressPDFInMemory(filePath);
           if (compressedBuffer.length >= fileBuffer.length) {
-            logEvent(`⚠️ Compressed file is larger than original for ${fileName}, using original`);
+            logEvent(`⚠️ ${fileName}: ${fileSizeMB} MB → ${(compressedBuffer.length / 1024 / 1024).toFixed(2)} MB (compressed larger, using original)`);
             compressedBuffer = fileBuffer;
           } else {
             compressionRatio = parseFloat(((fileBuffer.length - compressedBuffer.length) / fileBuffer.length * 100).toFixed(2));
             compressedSizeMB = parseFloat((compressedBuffer.length / 1024 / 1024).toFixed(2));
-            logEvent(`📊 Compression achieved: ${compressionRatio}% reduction for ${fileName}`);
+            logEvent(`📊 ${fileName}: ${fileSizeMB} MB → ${compressedSizeMB} MB (${compressionRatio}% reduction)`);
           }
         } catch (compressionError) {
           logEvent(`⚠️ Compression failed for ${fileName}, using original file: ${compressionError}`);
@@ -1085,6 +1118,7 @@ function setupUploadWatcher() {
           const resp = await fetch(UPLOAD_API_URL, {
             method: "POST",
             body: formData,
+            headers: { "x-exam-event": global.EXAM_EVENT },
             timeout: 30000, // 30 second timeout
           });
           // if (!resp.ok) {
@@ -1143,7 +1177,7 @@ function setupUploadWatcher() {
         }
         // Process the API response
         const { savedFiles, failedFiles } = result.data;
-        console.log("Failed Files: ", failedFiles);
+        logEvent(`Failed Files: ${JSON.stringify(failedFiles)}`);
         // Log the complete API response
         logEvent(`📋 API Response for ${fileName}:`);
         logEvent(`Status: ${result.status}`);

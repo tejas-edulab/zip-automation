@@ -24,11 +24,23 @@ async function installGhostscript() {
 // -------------------- WINDOWS --------------------
 
 async function installGhostscriptWindows() {
-  const gsUrl = 'https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/latest/download/gs10060w64.exe'; // Example version
-  const installerPath = path.join(os.tmpdir(), 'gs_installer.exe');
+  console.log(`🔍 Fetching latest Ghostscript release info...`);
 
-  console.log(`⬇ Downloading Ghostscript for Windows...`);
-  const response = await fetch(gsUrl);
+  // Get latest release metadata from GitHub API
+  const apiRes = await fetch('https://api.github.com/repos/ArtifexSoftware/ghostpdl-downloads/releases/latest', {
+    headers: { 'User-Agent': 'ghostscript-installer' },
+  });
+  if (!apiRes.ok) throw new Error(`GitHub API error: ${apiRes.statusText}`);
+  const release = await apiRes.json();
+
+  // Find the Windows 64-bit installer asset (matches gs*w64.exe)
+  const asset = release.assets.find(a => /gs\w+w64\.exe$/i.test(a.name));
+  if (!asset) throw new Error(`Could not find Windows 64-bit installer in release: ${release.tag_name}`);
+
+  console.log(`⬇ Downloading ${asset.name} (${release.tag_name})...`);
+  const installerPath = path.join(os.tmpdir(), asset.name);
+
+  const response = await fetch(asset.browser_download_url);
   if (!response.ok) throw new Error(`Failed to download: ${response.statusText}`);
   await streamPipeline(response.body, fs.createWriteStream(installerPath));
 
