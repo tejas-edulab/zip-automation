@@ -1,5 +1,6 @@
 COMPRESSED_FOLDER/
 node_modules/
+.env.local
 READY_TO_UPLOAD_ZIPS/
 SCANNED_FOLDER/
 SLR-WA-36/

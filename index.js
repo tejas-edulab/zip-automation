@@ -11,6 +11,15 @@ import pdf from "pdf-parse/lib/pdf-parse.js";
 import dns from "node:dns";
 import { Logtail } from "@logtail/node";
 
+// Keep scanner credentials outside the tracked repository.
+const localEnvPath = path.join(process.cwd(), ".env.local");
+if (fs.existsSync(localEnvPath)) {
+  if (typeof process.loadEnvFile !== "function") {
+    throw new Error("Node.js 20.12+ is required to load .env.local");
+  }
+  process.loadEnvFile(localEnvPath);
+}
+
 const logtail = new Logtail("CkKtQHNySpmNvBv7F1fiDRqh", {
   endpoint: "https://s2366261.eu-fsn-3.betterstackdata.com",
 });
@@ -45,6 +54,8 @@ let UPLOAD_ERROR = DEFAULT_PATHS.UPLOAD_ERROR;
 
 const isWin = process.platform === "win32";
 const gsPackage = isWin ? "gswin64c" : "gs";
+const UPLOAD_API_URL = process.env.UPLOAD_API_URL || "http://localhost:5010/v1/assessment/answer-code-bulk";
+const UPLOAD_AUTOMATION_API_KEY = process.env.UPLOAD_AUTOMATION_API_KEY;
 const logStream = fs.createWriteStream(LOG_FILE, { flags: "a" });
 inquirer.registerPrompt("directory", directory);
 
@@ -125,6 +136,34 @@ async function promptForFolders() {
       validate: (input) => (fs.existsSync(input) && fs.lstatSync(input).isDirectory()) || "Invalid folder path",
     },
     {
+      type: "input",
+      name: "upload",
+      message: "📤 Enter path for UPLOAD_FOLDER:",
+      default: DEFAULT_PATHS.UPLOAD_FOLDER,
+      validate: (input) => (fs.existsSync(input) && fs.lstatSync(input).isDirectory()) || "Invalid folder path",
+    },
+    {
+      type: "input",
+      name: "error",
+      message: "⚠️ Enter path for ERROR_FOLDER (OCR failures):",
+      default: DEFAULT_PATHS.ERROR_FOLDER,
+      validate: (input) => (fs.existsSync(input) && fs.lstatSync(input).isDirectory()) || "Invalid folder path",
+    },
+    {
+      type: "input",
+      name: "systemUploaded",
+      message: "✅ Enter path for SYSTEM_UPLOADED:",
+      default: DEFAULT_PATHS.SYSTEM_UPLOADED,
+      validate: (input) => (fs.existsSync(input) && fs.lstatSync(input).isDirectory()) || "Invalid folder path",
+    },
+    {
+      type: "input",
+      name: "uploadError",
+      message: "❌ Enter path for UPLOAD_ERROR:",
+      default: DEFAULT_PATHS.UPLOAD_ERROR,
+      validate: (input) => (fs.existsSync(input) && fs.lstatSync(input).isDirectory()) || "Invalid folder path",
+    },
+    {
       type: "number",
       name: "scanConcurrency",
       message: "👥 Enter concurrency for scan queue (1-5):",
@@ -149,8 +188,8 @@ async function promptForFolders() {
       type: "list",
       name: "examEvent",
       message: "📅 Which exam event?",
-      default: "summer_2025-2026",
-      choices: ["summer_2025-2026", "winter_2025-2026"],
+      default: "summer_2026-2027",
+      choices: ["summer_2026-2027","summer_2025-2026", "winter_2025-2026", ],
     },
   ]);
 
@@ -160,6 +199,10 @@ async function promptForFolders() {
   SCANNER_NAME = responses.scanner;
   PC_NAME = responses.pc;
   LINEARIZED_FOLDER = responses.linearized;
+  UPLOAD_FOLDER = responses.upload;
+  ERROR_FOLDER = responses.error;
+  SYSTEM_UPLOADED = responses.systemUploaded;
+  UPLOAD_ERROR = responses.uploadError;
 
   // Store concurrency settings globally
   global.QUEUE_CONCURRENCY = {
@@ -476,6 +519,7 @@ function splitIntoBatches(files, batchSize) {
 // Upload files to system API
 async function uploadToSystem(files) {
   try {
+    if (!UPLOAD_AUTOMATION_API_KEY) throw new Error("UPLOAD_AUTOMATION_API_KEY is not configured");
     const formData = new FormData();
     const existingFiles = [];
 
@@ -549,12 +593,12 @@ async function uploadToSystem(files) {
       message: "Initiating upload to system API",
     });
 
-    const response = await fetch("https://devpahsu.paperevaluation.com/api/v1/assessment/answer-code-bulk", {
+    const response = await fetch(UPLOAD_API_URL, {
       method: "POST",
       body: formData,
       headers: {
-        // Remove any content-type header to let the browser set it with the boundary
-        // 'Content-Type': 'multipart/form-data' // Let browser set this
+        "x-api-key": UPLOAD_AUTOMATION_API_KEY,
+        "x-scanner-id": `${SCANNER_NAME || "Scanner"} @ ${PC_NAME || os.hostname()}`,
       },
     });
 
@@ -980,6 +1024,7 @@ function setupLinearizedWatcher() {
           }
         }
       } catch (error) {
+        console.log(error)
         logEvent(`❌ Error processing ${path.basename(filePath)}: ${error.message}`);
         logCsvEvent({
           folder: LINEARIZED_FOLDER,
@@ -1012,8 +1057,12 @@ function setupLinearizedWatcher() {
 
 // Setup upload folder watcher
 function setupUploadWatcher() {
+  console.log("Setting up upload watcher...", UPLOAD_API_URL);
+  if (!UPLOAD_AUTOMATION_API_KEY) {
+    throw new Error("UPLOAD_AUTOMATION_API_KEY is required before starting the upload watcher");
+  }
   const uploadQueue = new PQueue({ concurrency: global.QUEUE_CONCURRENCY.upload });
-  const UPLOAD_API_URL = process.env.UPLOAD_API_URL || "https://pahsu.paperevaluation.com/api/v1/assessment/answer-code-bulk";
+
   const MAX_RETRIES = 3;
   const RETRY_DELAY = 1000;
 
@@ -1060,10 +1109,13 @@ function setupUploadWatcher() {
   uploadWatcher.on("add", async (filePath) => {
     if (!filePath.toLowerCase().endsWith(".pdf")) return;
     uploadQueue.add(async () => {
+      console.log("Processing upload for file:", UPLOAD_API_URL);
       const fileName = path.basename(filePath);
       logEvent(`📄 New file detected in upload folder: ${fileName}`);
-      // Check internet connection first
-      const isOnline = await checkInternetConnection();
+      // Local backend uploads do not require public DNS access.
+      const uploadHost = new URL(UPLOAD_API_URL).hostname;
+      const isOnline = ["localhost", "127.0.0.1", "::1"].includes(uploadHost)
+        || await checkInternetConnection();
       if (!isOnline) {
         logEvent("⚠️ No internet connection, skipping upload...");
         return;
@@ -1118,14 +1170,23 @@ function setupUploadWatcher() {
           const resp = await fetch(UPLOAD_API_URL, {
             method: "POST",
             body: formData,
-            headers: { "x-exam-event": global.EXAM_EVENT },
-            timeout: 30000, // 30 second timeout
+            headers: {
+              "x-exam-event": global.EXAM_EVENT,
+              "x-api-key": UPLOAD_AUTOMATION_API_KEY,
+              // Recorded by the backend as the uploader, so the review trail names the scanning station.
+              "x-scanner-id": `${SCANNER_NAME || "Scanner"} @ ${PC_NAME || os.hostname()}`,
+            },
+            signal: AbortSignal.timeout(30000),
           });
           // if (!resp.ok) {
           //   throw new Error(`Upload failed with status: ${resp.status}`);
           // }
           return resp;
         });
+        if (response.status === 401 || response.status === 403) {
+          logEvent(`❌ Upload authentication failed (${response.status}) for ${fileName}; PDF remains in upload folder`);
+          return;
+        }
         const result = await response.json();
         // Check for specific error codes
         if (response.status === 422) {
@@ -1176,7 +1237,8 @@ function setupUploadWatcher() {
           throw new Error("Invalid response from upload API");
         }
         // Process the API response
-        const { savedFiles, failedFiles } = result.data;
+        const savedFiles = Array.isArray(result.data.savedFiles) ? result.data.savedFiles : [];
+        const failedFiles = Array.isArray(result.data.failedFiles) ? result.data.failedFiles : [];
         logEvent(`Failed Files: ${JSON.stringify(failedFiles)}`);
         // Log the complete API response
         logEvent(`📋 API Response for ${fileName}:`);
@@ -1184,37 +1246,7 @@ function setupUploadWatcher() {
         logEvent(`Message: ${result.message}`);
         logEvent(`Successfully Uploaded Files: ${JSON.stringify(savedFiles)}`);
         logEvent(`Not Uploaded Files: ${JSON.stringify(failedFiles)}`);
-        // Process failed files to determine error type and move to appropriate folder
-        if (failedFiles && failedFiles.length > 0) {
-          failedFiles.forEach(async (failedFile) => {
-            const errorMessage = failedFile.Error;
-            if (errorMessage) {
-              const [_, errorType] = errorMessage.split(" - ");
-              if (errorType) {
-                // Create error-specific folder if it doesn't exist
-                const errorTypeFolder = path.join(UPLOAD_ERROR, errorType.trim());
-                if (!fs.existsSync(errorTypeFolder)) {
-                  fs.mkdirSync(errorTypeFolder, { recursive: true });
-                }
-                // Move file to error-specific folder
-                const errorPath = path.join(errorTypeFolder, fileName);
-                if (await safelyMoveFile(filePath, errorPath)) {
-                  logEvent(`⚠️ Moved ${fileName} to error folder: ${errorType}`);
-                  logCsvEvent({
-                    folder: UPLOAD_ERROR,
-                    file: fileName,
-                    status: "Fail",
-                    action: "Upload Failed",
-                    message: `Moved to ${errorType} folder: ${errorMessage}`,
-                    errorType: errorType.trim(),
-                    fileSizeMB,
-                  });
-                }
-              }
-            }
-          });
-        }
-        const fileNameWithoutExt = fileName.replace(".pdf", "");
+        const fileNameWithoutExt = path.parse(fileName).name;
         // Check if the current file was successfully uploaded
         if (savedFiles.includes(fileNameWithoutExt)) {
           // Move to success folder
@@ -1235,13 +1267,20 @@ function setupUploadWatcher() {
         } else {
           // Check if file is in failedFiles and extract error message
           const failedEntry = failedFiles.find((entry) => {
-            const [failedFileName] = entry.split(" - ");
-            return failedFileName.trim() === fileNameWithoutExt;
+            const failedFileName = typeof entry === "string"
+              ? entry.split(" - ")[0].trim()
+              : String(entry?.barcodeId ?? "");
+            return failedFileName === fileNameWithoutExt;
           });
           if (failedEntry) {
-            const [_, errorMessage] = failedEntry.split(" - ");
-            // Move to error folder with the specific error message
-            const errorPath = path.join(UPLOAD_ERROR, fileName);
+            const errorMessage = typeof failedEntry === "string"
+              ? failedEntry.split(" - ").slice(1).join(" - ")
+              : failedEntry.Error;
+            // Keep API failures separate from transport errors.
+            const errorType = String(errorMessage || "Unknown").replace(/[^a-zA-Z0-9 _-]/g, "_").trim();
+            const errorFolder = path.join(UPLOAD_ERROR, errorType || "Unknown");
+            await fs.promises.mkdir(errorFolder, { recursive: true });
+            const errorPath = path.join(errorFolder, fileName);
             if (await safelyMoveFile(filePath, errorPath)) {
               logEvent(`❌ File ${fileName} was not uploaded: ${errorMessage}`);
               logCsvEvent({
@@ -1257,7 +1296,9 @@ function setupUploadWatcher() {
           } else {
             // Handle case where file is not found in either list
             logEvent(`⚠️ File ${fileName} status unknown: Not found in upload response lists`);
-            const errorPath = path.join(UPLOAD_ERROR, fileName);
+            const errorFolder = path.join(UPLOAD_ERROR, "Unknown Upload Status");
+            await fs.promises.mkdir(errorFolder, { recursive: true });
+            const errorPath = path.join(errorFolder, fileName);
             if (await safelyMoveFile(filePath, errorPath)) {
               logEvent(`⚠️ Moved ${fileName} to error folder due to unknown upload status`);
               logCsvEvent({
@@ -1273,20 +1314,31 @@ function setupUploadWatcher() {
           }
         }
       } catch (error) {
-        logEvent(`❌ Error processing ${fileName}: ${error.message}`);
+        // Node's fetch reports "fetch failed" and hides the real reason (ECONNREFUSED, ENOTFOUND,
+        // certificate error, timeout) in error.cause; surface it with the target URL so the log
+        // says which backend was called and why it could not be reached.
+        const cause = error && error.cause
+          ? ` (${[error.cause.code, error.cause.message, error.cause.address && `${error.cause.address}:${error.cause.port}`].filter(Boolean).join(" ")})`
+          : "";
+        const detail = `${error.message}${cause} → ${UPLOAD_API_URL}`;
+        console.error(error);
+        logEvent(`❌ Error processing ${fileName}: ${detail}`);
         logCsvEvent({
           folder: UPLOAD_FOLDER,
           file: fileName,
           status: "Fail",
           action: "Upload Failed",
-          message: error.toString(),
+          message: detail,
           errorType: "Exception",
           fileSizeMB,
         });
-        // Move to error folder
-        const errorPath = path.join(UPLOAD_ERROR, fileName);
+        // Transport / parsing failures (server unreachable, timeout, non-JSON reply) get their own folder
+        // so they are not mixed up with files the API explicitly refused.
+        const errorFolder = path.join(UPLOAD_ERROR, "Upload Exception");
+        await fs.promises.mkdir(errorFolder, { recursive: true }).catch(() => {});
+        const errorPath = path.join(errorFolder, fileName);
         if (await safelyMoveFile(filePath, errorPath)) {
-          logEvent(`⚠️ Moved ${fileName} to error folder after failed upload`);
+          logEvent(`⚠️ Moved ${fileName} to error folder "Upload Exception" after failed upload`);
         }
       }
     });
@@ -1303,7 +1355,7 @@ function setupUploadWatcher() {
     });
   });
 
-  logEvent(`📡 Watching upload folder for system uploads`);
+  logEvent(`📡 Watching upload folder for system uploads → ${UPLOAD_API_URL}`);
   logCsvEvent({
     folder: UPLOAD_FOLDER,
     file: "",
@@ -1315,6 +1367,13 @@ function setupUploadWatcher() {
 
 // Main runner
 const main = async () => {
+  // The uploader cannot authenticate without the shared secret, so stop before any
+  // watcher starts moving files (see .env.local.example).
+  if (!UPLOAD_AUTOMATION_API_KEY) {
+    console.error("❌ UPLOAD_AUTOMATION_API_KEY is not configured. Copy .env.local.example to .env.local and set the same secret as osmBackend.");
+    process.exit(1);
+  }
+
   // Verify Ghostscript is installed before doing anything else
   await new Promise((resolve) => {
     exec(`"${gsPackage}" --version`, (err) => {
